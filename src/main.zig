@@ -159,6 +159,7 @@ var g_normal_strength: f32 = 1.5; // Normal map strength
 var g_denoise_strength: f32 = 0.5; // Denoising strength (0 = off)
 var g_fog_density: f32 = 0.0; // Volumetric fog density (0 = off)
 var g_fog_color: [3]f32 = .{ 0.8, 0.85, 0.95 }; // Fog color (blueish)
+var g_film_grain: f32 = 0.0; // Film grain strength (0 = off)
 
 fn windowProc(hwnd: win32.HWND, msg: c_uint, wparam: win32.WPARAM, lparam: win32.LPARAM) callconv(std.builtin.CallingConvention.c) win32.LRESULT {
     switch (msg) {
@@ -353,6 +354,7 @@ const compute_shader_source: [*:0]const u8 =
     \\uniform float u_denoise;
     \\uniform float u_fog_density;
     \\uniform vec3 u_fog_color;
+    \\uniform float u_film_grain;
     \\
     \\#define MAX_DEPTH 16
     \\#define BVH_STACK_SIZE 64
@@ -1457,6 +1459,30 @@ const compute_shader_source: [*:0]const u8 =
     \\    float vignette = 1.0 - u_vignette * length((uv_vignette - 0.5) * 1.2);
     \\    result *= vignette;
     \\
+    \\    // Film grain effect - adds subtle analog film texture
+    \\    if (u_film_grain > 0.0) {
+    \\        // Generate noise based on pixel position and frame
+    \\        float grain_seed = float(pixel.x + pixel.y * u_width) + float(u_frame) * 0.1;
+    \\        float grain_noise = fract(sin(grain_seed * 12.9898 + grain_seed * 78.233) * 43758.5453);
+    \\        grain_noise = (grain_noise - 0.5) * 2.0;  // -1 to 1
+    \\
+    \\        // Make grain stronger in darker areas (like real film)
+    \\        float luminance = dot(result, vec3(0.299, 0.587, 0.114));
+    \\        float grain_intensity = u_film_grain * (1.0 - luminance * 0.5);
+    \\
+    \\        // Add colored grain for more realistic film look
+    \\        vec3 grain_color = vec3(
+    \\            fract(sin(grain_seed * 43.758) * 2345.6789),
+    \\            fract(sin(grain_seed * 67.890) * 3456.7890),
+    \\            fract(sin(grain_seed * 89.012) * 4567.8901)
+    \\        );
+    \\        grain_color = (grain_color - 0.5) * 2.0;
+    \\
+    \\        // Mix luminance grain with subtle color grain
+    \\        vec3 grain = mix(vec3(grain_noise), grain_color, 0.3) * grain_intensity * 0.1;
+    \\        result += grain;
+    \\    }
+    \\
     \\    imageStore(outputImage, pixel, vec4(result, 1.0));
     \\}
 ;
@@ -1828,6 +1854,7 @@ pub fn main() !void {
     const u_denoise_loc = glGetUniformLocation(compute_program, "u_denoise");
     const u_fog_density_loc = glGetUniformLocation(compute_program, "u_fog_density");
     const u_fog_color_loc = glGetUniformLocation(compute_program, "u_fog_color");
+    const u_film_grain_loc = glGetUniformLocation(compute_program, "u_film_grain");
 
     g_camera_yaw = std.math.atan2(@as(f32, -3.0), @as(f32, -13.0));
 
@@ -2012,6 +2039,15 @@ pub fn main() !void {
             }
             camera_moved = true; g_keys['P'] = false;
         }
+        // G - Film grain (hold Shift for decrease)
+        if (g_keys['G']) {
+            if (g_keys[0x10]) {
+                g_film_grain = @max(0.0, g_film_grain - 0.1);
+            } else {
+                g_film_grain = @min(2.0, g_film_grain + 0.1);
+            }
+            camera_moved = true; g_keys['G'] = false;
+        }
 
         // Reset accumulation when camera moves
         if (camera_moved) {
@@ -2049,6 +2085,7 @@ pub fn main() !void {
         glUniform1f(u_denoise_loc, g_denoise_strength);
         glUniform1f(u_fog_density_loc, g_fog_density);
         glUniform3f(u_fog_color_loc, g_fog_color[0], g_fog_color[1], g_fog_color[2]);
+        glUniform1f(u_film_grain_loc, g_film_grain);
 
         const groups_x = (RENDER_WIDTH + 15) / 16;
         const groups_y = (RENDER_HEIGHT + 15) / 16;
