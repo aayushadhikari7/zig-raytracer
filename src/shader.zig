@@ -67,8 +67,8 @@ pub const compute_shader_source: [*:0]const u8 =
     \\uniform float u_holographic;  // Holographic material
     \\uniform float u_ascii_mode;   // ASCII art mode
     \\
-    \\#define MAX_DEPTH 16
-    \\#define BVH_STACK_SIZE 64
+    \\#define MAX_DEPTH 4
+    \\#define BVH_STACK_SIZE 48  // Reduced for better performance
     \\
     \\struct Sphere {
     \\    vec3 center;
@@ -157,12 +157,13 @@ pub const compute_shader_source: [*:0]const u8 =
     \\// Mesh instance for instanced rendering
     \\struct MeshInstance {
     \\    mat4 transform;        // Model transform matrix
+    \\    mat4 inv_transform;    // PRE-COMPUTED inverse (avoids per-ray inversion!)
     \\    vec3 normal_row0;
     \\    int mesh_start;        // Start index in triangle buffer
     \\    vec3 normal_row1;
     \\    int mesh_end;          // End index in triangle buffer
     \\    vec3 normal_row2;
-    \\    int pad;
+    \\    int mesh_bvh_root;     // Root index into mesh_bvh_nodes (-1 = no BVH, linear search)
     \\};
     \\
     \\layout(std430, binding = 7) buffer InstanceBuffer {
@@ -173,6 +174,11 @@ pub const compute_shader_source: [*:0]const u8 =
     \\
     \\layout(std430, binding = 8) buffer InstanceBVHBuffer {
     \\    BVHNode instance_bvh[];
+    \\};
+    \\
+    \\// Per-mesh BVH nodes (object-space BVHs for instanced meshes)
+    \\layout(std430, binding = 12) buffer MeshBVHBuffer {
+    \\    BVHNode mesh_bvh_nodes[];
     \\};
     \\
     \\uniform int u_instance_bvh_root;
@@ -226,28 +232,77 @@ pub const compute_shader_source: [*:0]const u8 =
     \\    return float(state) / 4294967295.0;
     \\}
     \\
-    \\vec3 random_in_unit_sphere() {
-    \\    for (int i = 0; i < 100; i++) {
-    \\        vec3 p = vec3(rand() * 2.0 - 1.0, rand() * 2.0 - 1.0, rand() * 2.0 - 1.0);
-    \\        if (dot(p, p) < 1.0) return p;
-    \\    }
-    \\    return vec3(0.0);
+    \\// Direct formula - NO LOOPS! (was 100-iteration rejection sampling)
+    \\vec3 random_unit_vector() {
+    \\    float u = rand();
+    \\    float v = rand();
+    \\    float theta = 2.0 * 3.14159265 * u;
+    \\    float phi = acos(2.0 * v - 1.0);
+    \\    return vec3(sin(phi) * cos(theta), sin(phi) * sin(theta), cos(phi));
     \\}
     \\
-    \\vec3 random_unit_vector() {
-    \\    return normalize(random_in_unit_sphere());
+    \\vec3 random_in_unit_sphere() {
+    \\    return random_unit_vector() * pow(rand(), 1.0/3.0);
     \\}
     \\
     \\vec3 random_in_unit_disk() {
-    \\    for (int i = 0; i < 100; i++) {
-    \\        vec3 p = vec3(rand() * 2.0 - 1.0, rand() * 2.0 - 1.0, 0.0);
-    \\        if (dot(p, p) < 1.0) return p;
-    \\    }
-    \\    return vec3(0.0);
+    \\    float r = sqrt(rand());
+    \\    float theta = 2.0 * 3.14159265 * rand();
+    \\    return vec3(r * cos(theta), r * sin(theta), 0.0);
     \\}
     \\
     \\// Bokeh shape types: 0=circle, 1=hexagon, 2=star, 3=heart
     \\uniform int u_bokeh_shape;
+    \\
+    \\// Debug/visualization modes: 0=normal, 1=BVH heatmap, 2=normals, 3=depth
+    \\uniform int u_debug_mode;
+    \\
+    \\// Global intersection counter for BVH visualization
+    \\int g_intersection_count = 0;
+    \\
+    \\// Convert wavelength (380-780nm) to RGB for heatmap visualization
+    \\// Based on: https://www.shadertoy.com/view/ls2Bz1
+    \\vec3 wavelengthToRGB(float wavelength) {
+    \\    float t;
+    \\    vec3 rgb;
+    \\    if (wavelength >= 380.0 && wavelength < 440.0) {
+    \\        t = (wavelength - 380.0) / (440.0 - 380.0);
+    \\        rgb = vec3(0.33 - 0.33 * t, 0.0, 1.0);
+    \\    } else if (wavelength >= 440.0 && wavelength < 490.0) {
+    \\        t = (wavelength - 440.0) / (490.0 - 440.0);
+    \\        rgb = vec3(0.0, t, 1.0);
+    \\    } else if (wavelength >= 490.0 && wavelength < 510.0) {
+    \\        t = (wavelength - 490.0) / (510.0 - 490.0);
+    \\        rgb = vec3(0.0, 1.0, 1.0 - t);
+    \\    } else if (wavelength >= 510.0 && wavelength < 580.0) {
+    \\        t = (wavelength - 510.0) / (580.0 - 510.0);
+    \\        rgb = vec3(t, 1.0, 0.0);
+    \\    } else if (wavelength >= 580.0 && wavelength < 645.0) {
+    \\        t = (wavelength - 580.0) / (645.0 - 580.0);
+    \\        rgb = vec3(1.0, 1.0 - t, 0.0);
+    \\    } else if (wavelength >= 645.0 && wavelength <= 780.0) {
+    \\        rgb = vec3(1.0, 0.0, 0.0);
+    \\    } else {
+    \\        rgb = vec3(0.0);
+    \\    }
+    \\    // Apply intensity fade at edges of visible spectrum
+    \\    float factor = 1.0;
+    \\    if (wavelength >= 380.0 && wavelength < 420.0) {
+    \\        factor = 0.3 + 0.7 * (wavelength - 380.0) / (420.0 - 380.0);
+    \\    } else if (wavelength >= 700.0 && wavelength <= 780.0) {
+    \\        factor = 0.3 + 0.7 * (780.0 - wavelength) / (780.0 - 700.0);
+    \\    }
+    \\    return rgb * factor;
+    \\}
+    \\
+    \\// Convert intersection count to heatmap color
+    \\vec3 intersectionHeatmap(int count) {
+    \\    // Map count to wavelength: 0 = blue (480nm), high = red (650nm)
+    \\    // Typical scene: 0-100 intersections per ray
+    \\    float normalized = clamp(float(count) / 100.0, 0.0, 1.0);
+    \\    float wavelength = 480.0 + normalized * 170.0; // Blue to red
+    \\    return wavelengthToRGB(wavelength) * 1.5; // Boost brightness
+    \\}
     \\
     \\// Sample point in hexagonal aperture
     \\vec2 sample_hexagon(float u, float v) {
@@ -396,10 +451,9 @@ pub const compute_shader_source: [*:0]const u8 =
     \\    return d1;
     \\}
     \\
-    \\// Calculate CSG normal via gradient
-    \\vec3 csg_normal(vec3 p, int idx) {
+    \\// Calculate CSG normal via gradient (pass d to avoid recomputing)
+    \\vec3 csg_normal(vec3 p, int idx, float d) {
     \\    const float eps = 0.001;
-    \\    float d = sdf_csg_object(p, idx);
     \\    return normalize(vec3(
     \\        sdf_csg_object(p + vec3(eps, 0, 0), idx) - d,
     \\        sdf_csg_object(p + vec3(0, eps, 0), idx) - d,
@@ -420,10 +474,48 @@ pub const compute_shader_source: [*:0]const u8 =
     \\    int texture_id;
     \\};
     \\
-    \\// Ray march CSG object
+    \\// Fast ray-sphere intersection for bounding volume
+    \\bool hit_bounding_sphere(vec3 ro, vec3 rd, vec3 center, float radius, float t_max, out float t_enter) {
+    \\    vec3 oc = ro - center;
+    \\    float a = dot(rd, rd);
+    \\    float b = dot(oc, rd);
+    \\    float c = dot(oc, oc) - radius * radius;
+    \\    float discriminant = b * b - a * c;
+    \\    if (discriminant < 0.0) return false;
+    \\    float sqrtd = sqrt(discriminant);
+    \\    float t = (-b - sqrtd) / a;
+    \\    if (t < 0.001) t = (-b + sqrtd) / a;
+    \\    if (t < 0.001 || t > t_max) return false;
+    \\    t_enter = t;
+    \\    return true;
+    \\}
+    \\
+    \\// Compute bounding sphere for CSG object from its primitives
+    \\void csg_bounds(int idx, out vec3 center, out float radius) {
+    \\    CSGObject obj = csg_objects[idx];
+    \\    CSGPrimitive pa = csg_primitives[obj.prim_a];
+    \\    CSGPrimitive pb = csg_primitives[obj.prim_b];
+    \\    // Conservative bound: average center, sum of radii + distance between centers
+    \\    center = (pa.center + pb.center) * 0.5;
+    \\    float ra = max(max(pa.size.x, pa.size.y), pa.size.z) * 1.5; // Conservative
+    \\    float rb = max(max(pb.size.x, pb.size.y), pb.size.z) * 1.5;
+    \\    radius = ra + rb + length(pa.center - pb.center) * 0.5;
+    \\}
+    \\
+    \\// Ray march CSG object (with bounding sphere culling)
     \\bool hit_csg(vec3 ro, vec3 rd, int idx, float t_min, float t_max, out HitRecord rec) {
-    \\    float t = t_min;
-    \\    const int MAX_STEPS = 64;
+    \\    // Early out: check bounding sphere first
+    \\    vec3 bound_center;
+    \\    float bound_radius;
+    \\    csg_bounds(idx, bound_center, bound_radius);
+    \\    float t_enter;
+    \\    if (!hit_bounding_sphere(ro, rd, bound_center, bound_radius, t_max, t_enter)) {
+    \\        return false;
+    \\    }
+    \\
+    \\    // Start ray march from bounding sphere entry (or t_min if inside)
+    \\    float t = max(t_min, t_enter - 0.01);
+    \\    const int MAX_STEPS = 48;  // Reduced from 64
     \\    const float EPSILON = 0.001;
     \\
     \\    for (int i = 0; i < MAX_STEPS && t < t_max; i++) {
@@ -434,7 +526,7 @@ pub const compute_shader_source: [*:0]const u8 =
     \\            CSGObject obj = csg_objects[idx];
     \\            rec.t = t;
     \\            rec.point = p;
-    \\            rec.normal = csg_normal(p, idx);
+    \\            rec.normal = csg_normal(p, idx, d);
     \\            rec.front_face = dot(rd, rec.normal) < 0.0;
     \\            if (!rec.front_face) rec.normal = -rec.normal;
     \\            rec.sphere_idx = idx;
@@ -444,7 +536,7 @@ pub const compute_shader_source: [*:0]const u8 =
     \\            rec.texture_id = 0;
     \\            return true;
     \\        }
-    \\        t += max(d, EPSILON);
+    \\        t += max(d, EPSILON * 2.0);  // Slightly larger minimum step
     \\    }
     \\    return false;
     \\}
@@ -589,11 +681,48 @@ pub const compute_shader_source: [*:0]const u8 =
     \\    return hit_anything;
     \\}
     \\
-    \\// Test triangles in a specific range (for instanced meshes)
-    \\bool hit_triangles_range(vec3 ro, vec3 rd, int start_idx, int end_idx, float t_min, inout float closest, inout HitRecord rec) {
+    \\// Test triangles in a specific range using BVH (for instanced meshes)
+    \\bool hit_triangles_range(vec3 ro, vec3 rd, int start_idx, int end_idx, int bvh_root, float t_min, inout float closest, inout HitRecord rec) {
+    \\    // If we have a mesh BVH, use it for O(log n) traversal
+    \\    if (bvh_root >= 0) {
+    \\        vec3 inv_rd = 1.0 / rd;
+    \\        int stack[BVH_STACK_SIZE];
+    \\        int stack_ptr = 0;
+    \\        stack[stack_ptr++] = bvh_root;
+    \\
+    \\        bool hit_anything = false;
+    \\        HitRecord temp_rec;
+    \\
+    \\        while (stack_ptr > 0) {
+    \\            int node_idx = stack[--stack_ptr];
+    \\            BVHNode node = mesh_bvh_nodes[node_idx];
+    \\
+    \\            if (!hit_aabb(ro, inv_rd, node.aabb_min, node.aabb_max, closest)) {
+    \\                continue;
+    \\            }
+    \\
+    \\            if (node.left_child == -1) {
+    \\                // Leaf node - test triangle (index is relative to mesh start)
+    \\                int tri_idx = start_idx + node.right_child;
+    \\                if (hit_triangle(ro, rd, tri_idx, t_min, closest, temp_rec)) {
+    \\                    hit_anything = true;
+    \\                    closest = temp_rec.t;
+    \\                    rec = temp_rec;
+    \\                }
+    \\            } else {
+    \\                // Interior node - push children
+    \\                if (stack_ptr < BVH_STACK_SIZE - 1) {
+    \\                    stack[stack_ptr++] = node.right_child;
+    \\                    stack[stack_ptr++] = node.left_child;
+    \\                }
+    \\            }
+    \\        }
+    \\        return hit_anything;
+    \\    }
+    \\
+    \\    // Fallback: linear search if no BVH (should rarely happen)
     \\    bool hit_anything = false;
     \\    HitRecord temp_rec;
-    \\
     \\    for (int i = start_idx; i < end_idx && i < num_triangles; i++) {
     \\        if (hit_triangle(ro, rd, i, t_min, closest, temp_rec)) {
     \\            hit_anything = true;
@@ -653,17 +782,16 @@ pub const compute_shader_source: [*:0]const u8 =
     \\bool hit_instance(vec3 ro, vec3 rd, int inst_idx, float t_min, inout float closest, inout HitRecord rec) {
     \\    MeshInstance inst = instances[inst_idx];
     \\
-    \\    // Transform ray to object space
-    \\    mat4 inv_transform = inverse_mat4(inst.transform);
-    \\    vec3 local_ro = (inv_transform * vec4(ro, 1.0)).xyz;
-    \\    vec3 local_rd = normalize((inv_transform * vec4(rd, 0.0)).xyz);
+    \\    // Transform ray to object space (using PRE-COMPUTED inverse!)
+    \\    vec3 local_ro = (inst.inv_transform * vec4(ro, 1.0)).xyz;
+    \\    vec3 local_rd_unnorm = (inst.inv_transform * vec4(rd, 0.0)).xyz;
+    \\    float rd_scale = length(local_rd_unnorm);
+    \\    vec3 local_rd = local_rd_unnorm / rd_scale;  // normalize without recomputing
     \\
-    \\    // Scale factor for t (due to normalization of direction)
-    \\    float rd_scale = length((inv_transform * vec4(rd, 0.0)).xyz);
     \\    float local_closest = closest * rd_scale;
     \\
     \\    HitRecord local_rec;
-    \\    if (!hit_triangles_range(local_ro, local_rd, inst.mesh_start, inst.mesh_end, t_min * rd_scale, local_closest, local_rec)) {
+    \\    if (!hit_triangles_range(local_ro, local_rd, inst.mesh_start, inst.mesh_end, inst.mesh_bvh_root, t_min * rd_scale, local_closest, local_rec)) {
     \\        return false;
     \\    }
     \\
@@ -744,6 +872,7 @@ pub const compute_shader_source: [*:0]const u8 =
     \\    while (stack_ptr > 0) {
     \\        int node_idx = stack[--stack_ptr];
     \\        BVHNode node = nodes[node_idx];
+    \\        // g_intersection_count++; // Count BVH node visits
     \\
     \\        if (!hit_aabb(ro, inv_rd, node.aabb_min, node.aabb_max, closest)) {
     \\            continue;
@@ -752,6 +881,7 @@ pub const compute_shader_source: [*:0]const u8 =
     \\        if (node.left_child == -1) {
     \\            // Leaf node - test sphere
     \\            int sphere_idx = node.right_child;
+    \\            // g_intersection_count++; // Count primitive test
     \\            if (hit_sphere(ro, rd, sphere_idx, t_min, closest, temp_rec)) {
     \\                hit_anything = true;
     \\                closest = temp_rec.t;
@@ -766,6 +896,7 @@ pub const compute_shader_source: [*:0]const u8 =
     \\        }
     \\    }
     \\
+    \\    // DEBUG TEST 6: Enable triangles + instances
     \\    // Also check triangles
     \\    if (hit_triangles(ro, rd, t_min, closest, rec, closest)) {
     \\        hit_anything = true;
@@ -776,7 +907,7 @@ pub const compute_shader_source: [*:0]const u8 =
     \\        hit_anything = true;
     \\    }
     \\
-    \\    // Check CSG objects
+    \\    // Check CSG objects (with bounding sphere culling)
     \\    if (hit_csg_objects(ro, rd, t_min, closest, rec)) {
     \\        hit_anything = true;
     \\    }
@@ -787,7 +918,9 @@ pub const compute_shader_source: [*:0]const u8 =
     \\float reflectance(float cosine, float ior) {
     \\    float r0 = (1.0 - ior) / (1.0 + ior);
     \\    r0 = r0 * r0;
-    \\    return r0 + (1.0 - r0) * pow(1.0 - cosine, 5.0);
+    \\    float x = 1.0 - cosine;
+    \\    float x2 = x * x;
+    \\    return r0 + (1.0 - r0) * (x2 * x2 * x);  // x^5 without pow()
     \\}
     \\
     \\// ========== GGX/Cook-Torrance BRDF ==========
@@ -1607,6 +1740,118 @@ pub const compute_shader_source: [*:0]const u8 =
     \\    for (int depth = 0; depth < MAX_DEPTH; depth++) {
     \\        HitRecord rec;
     \\        if (hit_world_bvh(ro, rd, 0.001, 1e30, rec)) {
+    \\            // Get material properties - simplified
+    \\            int mat_type = 0;
+    \\            vec3 albedo = vec3(0.5);
+    \\            float fuzz = 0.0;
+    \\            float ior = 1.5;
+    \\            float emissive = 0.0;
+    \\
+    \\            if (rec.is_csg) {
+    \\                CSGObject csg = csg_objects[rec.sphere_idx];
+    \\                mat_type = csg.mat_type;
+    \\                albedo = csg.albedo;
+    \\                fuzz = csg.fuzz;
+    \\                ior = csg.ior;
+    \\                emissive = csg.emissive;
+    \\            } else if (rec.is_triangle) {
+    \\                Triangle tri = triangles[rec.sphere_idx];
+    \\                mat_type = tri.mat_type;
+    \\                albedo = tri.albedo;
+    \\                fuzz = 0.1;
+    \\                emissive = tri.emissive;
+    \\            } else {
+    \\                Sphere s = spheres[rec.sphere_idx];
+    \\                mat_type = s.mat_type;
+    \\                albedo = s.albedo;
+    \\                fuzz = s.fuzz;
+    \\                ior = s.ior;
+    \\                emissive = s.emissive;
+    \\            }
+    \\
+    \\            // Emissive (lights)
+    \\            if (mat_type == 3) {
+    \\                light += color * albedo * emissive;
+    \\                break;
+    \\            }
+    \\
+    \\            // Russian roulette after a few bounces
+    \\            if (depth > 2) {
+    \\                float p = max(color.x, max(color.y, color.z));
+    \\                if (rand() > p) break;
+    \\                color /= p;
+    \\            }
+    \\
+    \\            // Simplified materials
+    \\            if (mat_type == 0) {
+    \\                // Diffuse with simple direct sun lighting
+    \\                vec3 sun_dir = normalize(vec3(0.5, 0.35, -0.7));
+    \\                float sun_ndotl = max(dot(rec.normal, sun_dir), 0.0);
+    \\                if (sun_ndotl > 0.0) {
+    \\                    // Simple shadow check - just test if sun is blocked
+    \\                    HitRecord shadow_rec;
+    \\                    if (!hit_world_bvh(rec.point + rec.normal * 0.002, sun_dir, 0.001, 1000.0, shadow_rec)) {
+    \\                        light += color * albedo * sun_ndotl * vec3(1.0, 0.98, 0.9) * 2.0;
+    \\                    }
+    \\                }
+    \\                vec3 scatter = rec.normal + random_unit_vector();
+    \\                if (length(scatter) < 0.0001) scatter = rec.normal;
+    \\                rd = normalize(scatter);
+    \\                ro = rec.point + rec.normal * 0.001;
+    \\                color *= albedo;
+    \\            } else if (mat_type == 1) {
+    \\                // Metal - simple reflection
+    \\                vec3 reflected = reflect(rd, rec.normal);
+    \\                rd = normalize(reflected + fuzz * random_unit_vector());
+    \\                ro = rec.point + rec.normal * 0.001;
+    \\                color *= albedo;
+    \\                if (dot(rd, rec.normal) <= 0.0) break;
+    \\            } else if (mat_type == 2) {
+    \\                // Glass - simple refraction
+    \\                float ratio = rec.front_face ? (1.0/ior) : ior;
+    \\                float cos_theta = min(dot(-rd, rec.normal), 1.0);
+    \\                float sin_theta = sqrt(1.0 - cos_theta*cos_theta);
+    \\                bool cannot_refract = ratio * sin_theta > 1.0;
+    \\                float r = reflectance(cos_theta, ior);
+    \\                if (cannot_refract || rand() < r) {
+    \\                    rd = reflect(rd, rec.normal);
+    \\                    ro = rec.point + rec.normal * 0.001;
+    \\                } else {
+    \\                    rd = refract(rd, rec.normal, ratio);
+    \\                    ro = rec.point - rec.normal * 0.001;
+    \\                }
+    \\                color *= albedo;
+    \\            } else if (mat_type == 4) {
+    \\                // SSS - treat as diffuse
+    \\                vec3 scatter = rec.normal + random_unit_vector();
+    \\                if (length(scatter) < 0.0001) scatter = rec.normal;
+    \\                rd = normalize(scatter);
+    \\                ro = rec.point + rec.normal * 0.001;
+    \\                color *= albedo;
+    \\            } else {
+    \\                // Unknown - diffuse fallback
+    \\                vec3 scatter = rec.normal + random_unit_vector();
+    \\                rd = normalize(scatter);
+    \\                ro = rec.point + rec.normal * 0.001;
+    \\                color *= albedo;
+    \\            }
+    \\        } else {
+    \\            // Sky
+    \\            vec3 sky = getSky(rd);
+    \\            light += color * sky;
+    \\            break;
+    \\        }
+    \\    }
+    \\    return light;
+    \\}
+    \\
+    \\vec3 trace_FULL_DISABLED(vec3 ro, vec3 rd) {
+    \\    vec3 color = vec3(1.0);
+    \\    vec3 light = vec3(0.0);
+    \\
+    \\    for (int depth = 0; depth < MAX_DEPTH; depth++) {
+    \\        HitRecord rec;
+    \\        if (hit_world_bvh(ro, rd, 0.001, 1e30, rec)) {
     \\            // Get material properties from either triangle or sphere
     \\            int mat_type;
     \\            vec3 albedo;
@@ -1882,6 +2127,46 @@ pub const compute_shader_source: [*:0]const u8 =
     \\        rd = normalize(focus_point - ro);
     \\    }
     \\
+    \\    // Reset intersection counter for this ray
+    \\    g_intersection_count = 0;
+    \\
+    \\    // Debug visualization modes - handle BEFORE trace() to avoid expensive path tracing
+    \\    if (u_debug_mode == 1) {
+    \\        // BVH heatmap - only need to count intersections, not full path trace
+    \\        HitRecord rec;
+    \\        hit_world_bvh(ro, rd, 0.001, 1e30, rec);
+    \\        vec3 color = intersectionHeatmap(g_intersection_count);
+    \\        imageStore(outputImage, pixel, vec4(color, 1.0));
+    \\        imageStore(accumImage, pixel, vec4(color, 1.0));
+    \\        return;
+    \\    } else if (u_debug_mode == 2) {
+    \\        // Normal visualization - single ray, no bounces
+    \\        HitRecord rec;
+    \\        vec3 color;
+    \\        if (hit_world_bvh(ro, rd, 0.001, 1e30, rec)) {
+    \\            color = rec.normal * 0.5 + 0.5; // Map -1..1 to 0..1
+    \\        } else {
+    \\            color = vec3(0.0);
+    \\        }
+    \\        imageStore(outputImage, pixel, vec4(color, 1.0));
+    \\        imageStore(accumImage, pixel, vec4(color, 1.0));
+    \\        return;
+    \\    } else if (u_debug_mode == 3) {
+    \\        // Depth visualization - single ray, no bounces
+    \\        HitRecord rec;
+    \\        vec3 color;
+    \\        if (hit_world_bvh(ro, rd, 0.001, 1e30, rec)) {
+    \\            float depth = 1.0 - clamp(rec.t / 50.0, 0.0, 1.0); // White = close, black = far
+    \\            color = vec3(depth);
+    \\        } else {
+    \\            color = vec3(0.0);
+    \\        }
+    \\        imageStore(outputImage, pixel, vec4(color, 1.0));
+    \\        imageStore(accumImage, pixel, vec4(color, 1.0));
+    \\        return;
+    \\    }
+    \\
+    \\    // Path trace the scene
     \\    vec3 color = trace(ro, rd);
     \\
     \\    // Accumulation logic - reset ONLY on frame 1, sample 0
@@ -1900,39 +2185,38 @@ pub const compute_shader_source: [*:0]const u8 =
     \\    vec3 result = accum.rgb / accum.a;
     \\
     \\    // Temporal/spatial denoising - adaptive based on sample count
-    \\    if (u_denoise > 0.0) {
+    \\    if (u_denoise > 0.0 && accum.a < 32.0) {  // Skip after enough samples
     \\        result = spatialDenoise(pixel, result, accum.a);
     \\        result = varianceGuidedDenoise(pixel, result, accum.a);
     \\    }
     \\
-    \\    // Chromatic aberration - sample at offset positions for each channel
-    \\    vec2 center = vec2(u_width, u_height) * 0.5;
-    \\    vec2 pixelVec = vec2(pixel) - center;
-    \\    float dist = length(pixelVec) / length(center);
-    \\    float chromaStrength = u_chromatic * dist * dist;  // Stronger at edges
+    \\    // Chromatic aberration - only run if enabled (expensive!)
+    \\    if (u_chromatic > 0.0001) {
+    \\        vec2 center = vec2(u_width, u_height) * 0.5;
+    \\        vec2 pixelVec = vec2(pixel) - center;
+    \\        float dist = length(pixelVec) / length(center);
+    \\        float chromaStrength = u_chromatic * dist * dist;
     \\
-    \\    vec2 redOffset = pixelVec * (1.0 + chromaStrength);
-    \\    vec2 blueOffset = pixelVec * (1.0 - chromaStrength);
+    \\        vec2 redOffset = pixelVec * (1.0 + chromaStrength);
+    \\        vec2 blueOffset = pixelVec * (1.0 - chromaStrength);
     \\
-    \\    ivec2 redPixel = ivec2(center + redOffset);
-    \\    ivec2 bluePixel = ivec2(center + blueOffset);
+    \\        ivec2 redPixel = clamp(ivec2(center + redOffset), ivec2(0), ivec2(u_width - 1, u_height - 1));
+    \\        ivec2 bluePixel = clamp(ivec2(center + blueOffset), ivec2(0), ivec2(u_width - 1, u_height - 1));
     \\
-    \\    // Clamp to image bounds
-    \\    redPixel = clamp(redPixel, ivec2(0), ivec2(u_width - 1, u_height - 1));
-    \\    bluePixel = clamp(bluePixel, ivec2(0), ivec2(u_width - 1, u_height - 1));
+    \\        vec4 redAccum = imageLoad(accumImage, redPixel);
+    \\        vec4 blueAccum = imageLoad(accumImage, bluePixel);
     \\
-    \\    vec4 redAccum = imageLoad(accumImage, redPixel);
-    \\    vec4 blueAccum = imageLoad(accumImage, bluePixel);
+    \\        result.r = redAccum.r / max(redAccum.a, 1.0);
+    \\        result.b = blueAccum.b / max(blueAccum.a, 1.0);
+    \\    }
     \\
-    \\    result.r = redAccum.r / max(redAccum.a, 1.0);
-    \\    result.b = blueAccum.b / max(blueAccum.a, 1.0);
+    \\    // Motion blur based on camera movement - only if enabled
+    \\    if (u_motion_blur > 0.0001) {
+    \\        vec3 cameraDelta = u_camera_pos - u_prev_camera_pos;
+    \\        vec3 forwardDelta = u_camera_forward - u_prev_camera_forward;
+    \\        float motionMag = length(cameraDelta) + length(forwardDelta) * 2.0;
     \\
-    \\    // Motion blur based on camera movement
-    \\    vec3 cameraDelta = u_camera_pos - u_prev_camera_pos;
-    \\    vec3 forwardDelta = u_camera_forward - u_prev_camera_forward;
-    \\    float motionMag = length(cameraDelta) + length(forwardDelta) * 2.0;
-    \\
-    \\    if (motionMag > 0.001) {
+    \\        if (motionMag > 0.001) {
     \\        // Calculate screen-space velocity from camera motion
     \\        vec2 screenUV = (vec2(pixel) / vec2(u_width, u_height)) * 2.0 - 1.0;
     \\        vec3 viewDir = normalize(u_camera_forward + u_camera_right * screenUV.x * u_aspect + u_camera_up * screenUV.y);
@@ -1958,6 +2242,7 @@ pub const compute_shader_source: [*:0]const u8 =
     \\                totalWeight += weight;
     \\            }
     \\            result = motionBlurred / totalWeight;
+    \\        }
     \\        }
     \\    }
     \\

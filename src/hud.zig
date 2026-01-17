@@ -206,9 +206,9 @@ pub fn render(width: i32, height: i32, effects: anytype, show: bool) void {
     gl.glColor4f(0.0, 0.0, 0.0, 0.75);
     gl.glBegin(gl.GL_QUADS);
     gl.glVertex2f(10, 10);
-    gl.glVertex2f(320, 10);
-    gl.glVertex2f(320, 580);
-    gl.glVertex2f(10, 580);
+    gl.glVertex2f(360, 10);
+    gl.glVertex2f(360, 700);
+    gl.glVertex2f(10, 700);
     gl.glEnd();
 
     // Draw border
@@ -216,9 +216,9 @@ pub fn render(width: i32, height: i32, effects: anytype, show: bool) void {
     gl.glLineWidth(2);
     gl.glBegin(gl.GL_LINE_LOOP);
     gl.glVertex2f(10, 10);
-    gl.glVertex2f(320, 10);
-    gl.glVertex2f(320, 580);
-    gl.glVertex2f(10, 580);
+    gl.glVertex2f(360, 10);
+    gl.glVertex2f(360, 700);
+    gl.glVertex2f(10, 700);
     gl.glEnd();
 
     // Enable font texture
@@ -237,6 +237,21 @@ pub fn render(width: i32, height: i32, effects: anytype, show: bool) void {
     // Camera section
     drawTextLine(20, y, "-- CAMERA --", scale, 1.0, 1.0, 0.5);
     y += line_height;
+
+    // Flight mode indicator
+    const mode_str = if (effects.flight_mode) "FLIGHT (P)" else "FPS (P)";
+    const mode_color: f32 = if (effects.flight_mode) 0.5 else 0.8;
+    drawTextLine(20, y, mode_str, scale, mode_color, 1.0, mode_color);
+    y += line_height;
+
+    // Roll (only show in flight mode)
+    if (effects.flight_mode) {
+        const roll_str = floatToStr(&buf, effects.camera_roll * 57.3); // Convert to degrees
+        var line_buf2: [64]u8 = undefined;
+        const roll_line = std.fmt.bufPrint(&line_buf2, "Roll: {s} deg (Q/E)", .{roll_str}) catch "?";
+        drawTextLine(20, y, roll_line, scale, 0.6, 0.8, 1.0);
+        y += line_height;
+    }
 
     const fov_str = floatToStr(&buf, effects.fov);
     var line_buf: [64]u8 = undefined;
@@ -315,10 +330,29 @@ pub fn render(width: i32, height: i32, effects: anytype, show: bool) void {
 
     y += line_height * 0.3;
 
-    // Help
-    drawTextLine(20, y, "TAB: Toggle HUD", scale, 0.5, 0.5, 0.5);
+    // Debug modes
+    drawTextLine(20, y, "-- DEBUG MODES --", scale, 1.0, 1.0, 0.5);
     y += line_height;
-    drawTextLine(20, y, "SHIFT+Key: Decrease", scale, 0.5, 0.5, 0.5);
+
+    // Show current debug mode
+    const debug_names = [_][]const u8{ "5:Normal*", "6:BVH Heat*", "7:Normals*", "8:Depth*" };
+    const debug_mode_idx: usize = @intCast(@max(0, @min(3, effects.debug_mode)));
+    var debug_buf: [64]u8 = undefined;
+    const debug_line = std.fmt.bufPrint(&debug_buf, "Mode: {s}", .{debug_names[debug_mode_idx]}) catch "?";
+    const debug_r: f32 = if (effects.debug_mode > 0) 1.0 else 0.6;
+    const debug_g: f32 = if (effects.debug_mode > 0) 0.5 else 0.8;
+    drawTextLine(20, y, debug_line, scale, debug_r, debug_g, 1.0);
+    y += line_height;
+
+    drawTextLine(20, y, "5:Normal 6:BVH Heat 7:Normals 8:Depth", scale, 0.5, 0.5, 0.5);
+    y += line_height * 1.3;
+
+    // Help
+    drawTextLine(20, y, "WASD: Move, Space/Ctrl: Up/Down", scale, 0.5, 0.5, 0.5);
+    y += line_height;
+    drawTextLine(20, y, "SHIFT+Key: Decrease effect", scale, 0.5, 0.5, 0.5);
+    y += line_height;
+    drawTextLine(20, y, "R: Reset All  TAB: Toggle HUD", scale, 0.5, 0.5, 0.5);
     y += line_height;
     drawTextLine(20, y, "F12: Screenshot", scale, 0.5, 0.5, 0.5);
 

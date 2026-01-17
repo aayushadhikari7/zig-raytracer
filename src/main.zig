@@ -31,8 +31,8 @@ const Color = vec3.Color;
 const RENDER_WIDTH: u32 = 1920;
 const RENDER_HEIGHT: u32 = 1080;
 const WINDOW_SCALE: u32 = 1;
-const MAX_DEPTH: u32 = 16;
-const SAMPLES_PER_FRAME: u32 = 8;  // Higher = smoother when moving, lower FPS
+const MAX_DEPTH: u32 = 4;  // Reduced for better FPS
+const SAMPLES_PER_FRAME: u32 = 2;  // Lower = better FPS
 
 // OpenGL constants and types
 const GLuint = c_uint;
@@ -84,6 +84,7 @@ const PFNGLUNIFORM3FPROC = *const fn (GLint, f32, f32, f32) callconv(std.builtin
 const PFNGLGENBUFFERSPROC = *const fn (GLsizei, *GLuint) callconv(std.builtin.CallingConvention.c) void;
 const PFNGLBINDBUFFERPROC = *const fn (GLenum, GLuint) callconv(std.builtin.CallingConvention.c) void;
 const PFNGLBUFFERDATAPROC = *const fn (GLenum, GLsizeiptr, ?*const anyopaque, GLenum) callconv(std.builtin.CallingConvention.c) void;
+const PFNGLBUFFERSUBDATAPROC = *const fn (GLenum, isize, GLsizeiptr, ?*const anyopaque) callconv(std.builtin.CallingConvention.c) void;
 const PFNGLBINDBUFFERBASEPROC = *const fn (GLenum, GLuint, GLuint) callconv(std.builtin.CallingConvention.c) void;
 const PFNGLACTIVETEXTUREPROC = *const fn (GLenum) callconv(std.builtin.CallingConvention.c) void;
 
@@ -111,6 +112,7 @@ var glUniform3f: PFNGLUNIFORM3FPROC = undefined;
 var glGenBuffers: PFNGLGENBUFFERSPROC = undefined;
 var glBindBuffer: PFNGLBINDBUFFERPROC = undefined;
 var glBufferData: PFNGLBUFFERDATAPROC = undefined;
+var glBufferSubData: PFNGLBUFFERSUBDATAPROC = undefined;
 var glBindBufferBase: PFNGLBINDBUFFERBASEPROC = undefined;
 var glActiveTexture: PFNGLACTIVETEXTUREPROC = undefined;
 
@@ -141,12 +143,14 @@ var g_mouse_dy: i32 = 0;
 var g_camera_pos: Vec3 = Vec3.init(13, 2, 3);
 var g_camera_yaw: f32 = 0;
 var g_camera_pitch: f32 = -0.15;
+var g_camera_roll: f32 = 0.0; // Roll angle for flight mode
+var g_flight_mode: bool = false; // false = FPS camera, true = flight simulator camera
 
 // Runtime adjustable settings
 var g_fov: f32 = 20.0;
 var g_aperture: f32 = 0.0;
 var g_focus_dist: f32 = 10.0;
-var g_samples_per_frame: u32 = 8;
+var g_samples_per_frame: u32 = 1; // Use 1-4 keys to increase for quality
 var g_save_screenshot: bool = false;
 var g_show_help: bool = true;
 
@@ -156,7 +160,7 @@ var g_motion_blur_strength: f32 = 0.5;
 var g_bloom_strength: f32 = 0.15;
 var g_nee_enabled: bool = true;
 var g_roughness_mult: f32 = 1.0;
-var g_exposure: f32 = 1.0;
+var g_exposure: f32 = 2.0;
 var g_vignette_strength: f32 = 0.15;
 var g_normal_strength: f32 = 1.5; // Normal map strength
 var g_displacement: f32 = 0.5; // Displacement/parallax mapping strength
@@ -165,6 +169,7 @@ var g_fog_density: f32 = 0.0; // Volumetric fog density (0 = off)
 var g_fog_color: [3]f32 = .{ 0.8, 0.85, 0.95 }; // Fog color (blueish)
 var g_film_grain: f32 = 0.0; // Film grain strength (0 = off)
 var g_bokeh_shape: i32 = 0; // 0=circle, 1=hexagon, 2=star, 3=heart
+var g_debug_mode: i32 = 0; // 0=normal, 1=BVH heatmap, 2=normals, 3=depth
 var g_dispersion: f32 = 0.0; // Glass dispersion strength (0 = off, chromatic aberration in glass)
 var g_lens_flare: f32 = 0.0; // Lens flare strength (0 = off)
 var g_iridescence: f32 = 0.0; // Thin-film iridescence strength
@@ -194,12 +199,105 @@ var g_radial_blur: f32 = 0.0; // Radial / zoom blur
 var g_dither: f32 = 0.0; // Dithering effect
 var g_holographic: f32 = 0.0; // Holographic rainbow material
 var g_ascii_mode: f32 = 0.0; // ASCII art rendering
-var g_show_hud: bool = true; // Show control overlay
+var g_show_hud: bool = true; // TAB to toggle
+
+// Menu item IDs
+const IDM_FILE_LOAD_OBJ: c_uint = 101;
+const IDM_FILE_SCREENSHOT: c_uint = 102;
+const IDM_FILE_EXIT: c_uint = 103;
+const IDM_VIEW_HUD: c_uint = 201;
+const IDM_VIEW_NORMAL: c_uint = 202;
+const IDM_VIEW_HEATMAP: c_uint = 203;
+const IDM_VIEW_NORMALS: c_uint = 204;
+const IDM_VIEW_DEPTH: c_uint = 205;
+const IDM_VIEW_FLIGHT: c_uint = 206;
+const IDM_SCENE_ADD_SPHERE: c_uint = 301;
+const IDM_SCENE_ADD_LIGHT: c_uint = 302;
+const IDM_SCENE_ADD_GLASS: c_uint = 303;
+const IDM_SCENE_ADD_METAL: c_uint = 304;
+const IDM_SCENE_REMOVE_LAST: c_uint = 305;
+const IDM_SCENE_RESET: c_uint = 306;
+const IDM_HELP_CONTROLS: c_uint = 401;
+const IDM_HELP_ABOUT: c_uint = 402;
+
+// Menu flags
+const MF_STRING: c_uint = 0x0000;
+const MF_POPUP: c_uint = 0x0010;
+const MF_SEPARATOR: c_uint = 0x0800;
+
+// Pending actions from menu
+var g_menu_action: c_uint = 0;
+var g_scene_dirty: bool = false; // Flag to rebuild scene when spheres change
+
+fn createMenuBar(hwnd: win32.HWND) void {
+    const hMenu = win32.CreateMenu();
+    if (hMenu == null) return;
+
+    // File menu
+    const hFileMenu = win32.CreatePopupMenu();
+    _ = win32.AppendMenuA(hFileMenu, MF_STRING, IDM_FILE_LOAD_OBJ, "Load OBJ...");
+    _ = win32.AppendMenuA(hFileMenu, MF_STRING, IDM_FILE_SCREENSHOT, "Save Screenshot\tF12");
+    _ = win32.AppendMenuA(hFileMenu, MF_SEPARATOR, 0, null);
+    _ = win32.AppendMenuA(hFileMenu, MF_STRING, IDM_FILE_EXIT, "Exit\tAlt+F4");
+    _ = win32.AppendMenuA(hMenu, MF_POPUP, @intFromPtr(hFileMenu), "File");
+
+    // View menu
+    const hViewMenu = win32.CreatePopupMenu();
+    _ = win32.AppendMenuA(hViewMenu, MF_STRING, IDM_VIEW_HUD, "Toggle HUD\tTAB");
+    _ = win32.AppendMenuA(hViewMenu, MF_STRING, IDM_VIEW_FLIGHT, "Toggle Flight Mode\tP");
+    _ = win32.AppendMenuA(hViewMenu, MF_SEPARATOR, 0, null);
+    _ = win32.AppendMenuA(hViewMenu, MF_STRING, IDM_VIEW_NORMAL, "Normal View\t5");
+    _ = win32.AppendMenuA(hViewMenu, MF_STRING, IDM_VIEW_HEATMAP, "BVH Heatmap\t6");
+    _ = win32.AppendMenuA(hViewMenu, MF_STRING, IDM_VIEW_NORMALS, "Normals\t7");
+    _ = win32.AppendMenuA(hViewMenu, MF_STRING, IDM_VIEW_DEPTH, "Depth\t8");
+    _ = win32.AppendMenuA(hMenu, MF_POPUP, @intFromPtr(hViewMenu), "View");
+
+    // Scene menu
+    const hSceneMenu = win32.CreatePopupMenu();
+    _ = win32.AppendMenuA(hSceneMenu, MF_STRING, IDM_SCENE_ADD_SPHERE, "Add Diffuse Sphere");
+    _ = win32.AppendMenuA(hSceneMenu, MF_STRING, IDM_SCENE_ADD_METAL, "Add Metal Sphere");
+    _ = win32.AppendMenuA(hSceneMenu, MF_STRING, IDM_SCENE_ADD_GLASS, "Add Glass Sphere");
+    _ = win32.AppendMenuA(hSceneMenu, MF_STRING, IDM_SCENE_ADD_LIGHT, "Add Light");
+    _ = win32.AppendMenuA(hSceneMenu, MF_SEPARATOR, 0, null);
+    _ = win32.AppendMenuA(hSceneMenu, MF_STRING, IDM_SCENE_REMOVE_LAST, "Remove Last Sphere");
+    _ = win32.AppendMenuA(hSceneMenu, MF_STRING, IDM_SCENE_RESET, "Reset Scene\tR");
+    _ = win32.AppendMenuA(hMenu, MF_POPUP, @intFromPtr(hSceneMenu), "Scene");
+
+    // Help menu
+    const hHelpMenu = win32.CreatePopupMenu();
+    _ = win32.AppendMenuA(hHelpMenu, MF_STRING, IDM_HELP_CONTROLS, "Controls...");
+    _ = win32.AppendMenuA(hHelpMenu, MF_STRING, IDM_HELP_ABOUT, "About...");
+    _ = win32.AppendMenuA(hMenu, MF_POPUP, @intFromPtr(hHelpMenu), "Help");
+
+    _ = win32.SetMenu(hwnd, hMenu);
+}
 
 fn windowProc(hwnd: win32.HWND, msg: c_uint, wparam: win32.WPARAM, lparam: win32.LPARAM) callconv(std.builtin.CallingConvention.c) win32.LRESULT {
+    const WM_COMMAND: c_uint = 0x0111;
     switch (msg) {
         win32.WM_DESTROY, win32.WM_CLOSE => {
             g_running = false;
+            return 0;
+        },
+        WM_COMMAND => {
+            const cmd: c_uint = @truncate(wparam & 0xFFFF);
+            switch (cmd) {
+                IDM_FILE_EXIT => g_running = false,
+                IDM_FILE_SCREENSHOT => g_save_screenshot = true,
+                IDM_VIEW_HUD => g_show_hud = !g_show_hud,
+                IDM_VIEW_NORMAL => g_debug_mode = 0,
+                IDM_VIEW_HEATMAP => g_debug_mode = 1,
+                IDM_VIEW_NORMALS => g_debug_mode = 2,
+                IDM_VIEW_DEPTH => g_debug_mode = 3,
+                IDM_VIEW_FLIGHT => g_flight_mode = !g_flight_mode,
+                IDM_HELP_ABOUT => {
+                    _ = win32.MessageBoxA(hwnd, "Zig GPU Raytracer v1.0\n\nFeatures:\n- Path tracing with BVH\n- PBR materials\n- OBJ loading\n- Flight camera mode\n- 40+ post-processing effects\n\nPress TAB for controls.", "About Raytracer", 0x40);
+                },
+                IDM_HELP_CONTROLS => {
+                    _ = win32.MessageBoxA(hwnd, "CONTROLS:\n\nWASD - Move camera\nSpace/Ctrl - Up/Down\nRight-click - Toggle mouse look\nP - Toggle flight mode\nQ/E - Roll (flight mode)\nR - Reset everything\n\n5-8 - Debug modes\n1-4 - Quality presets\nTAB - Toggle HUD\nF12 - Screenshot\n\nShift+Key - Decrease effect", "Controls", 0x40);
+                },
+                else => g_menu_action = cmd, // Handle in main loop
+            }
             return 0;
         },
         win32.WM_KEYDOWN => {
@@ -348,6 +446,7 @@ fn loadGLFunctions() bool {
     glGenBuffers = load(PFNGLGENBUFFERSPROC, "glGenBuffers") orelse return false;
     glBindBuffer = load(PFNGLBINDBUFFERPROC, "glBindBuffer") orelse return false;
     glBufferData = load(PFNGLBUFFERDATAPROC, "glBufferData") orelse return false;
+    glBufferSubData = load(PFNGLBUFFERSUBDATAPROC, "glBufferSubData") orelse return false;
     glBindBufferBase = load(PFNGLBINDBUFFERBASEPROC, "glBindBufferBase") orelse return false;
     glActiveTexture = load(PFNGLACTIVETEXTUREPROC, "glActiveTexture") orelse return false;
     return true;
@@ -394,6 +493,9 @@ pub fn main() !void {
         std.debug.print("Failed to create window\n", .{});
         return;
     }
+
+    // Create the menu bar
+    createMenuBar(hwnd);
 
     const hdc = win32.GetDC(hwnd);
     g_hdc = hdc;
@@ -471,19 +573,17 @@ pub fn main() !void {
 
     std.debug.print("Scene: {} spheres, {} BVH nodes\n", .{ spheres.items.len, bvh_nodes.items.len });
 
+    // Pre-allocate buffers for max spheres (allows dynamic scene editing)
+    const MAX_SPHERES: usize = 200;
+    const MAX_BVH_NODES: usize = MAX_SPHERES * 2; // BVH has at most 2n-1 nodes
+
     // Upload sphere buffer
     var sphere_ssbo: GLuint = 0;
     glGenBuffers(1, &sphere_ssbo);
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, sphere_ssbo);
     const sphere_header_size = 16;
-    const sphere_buffer_size = sphere_header_size + spheres.items.len * @sizeOf(GPUSphere);
-    const sphere_buffer_data = try allocator.alloc(u8, sphere_buffer_size);
-    defer allocator.free(sphere_buffer_data);
-    const num_spheres: i32 = @intCast(spheres.items.len);
-    @memcpy(sphere_buffer_data[0..4], std.mem.asBytes(&num_spheres));
-    @memset(sphere_buffer_data[4..16], 0);
-    @memcpy(sphere_buffer_data[sphere_header_size..], std.mem.sliceAsBytes(spheres.items));
-    glBufferData(GL_SHADER_STORAGE_BUFFER, @intCast(sphere_buffer_size), sphere_buffer_data.ptr, GL_DYNAMIC_DRAW);
+    const sphere_buffer_size = sphere_header_size + MAX_SPHERES * @sizeOf(GPUSphere);
+    glBufferData(GL_SHADER_STORAGE_BUFFER, @intCast(sphere_buffer_size), null, GL_DYNAMIC_DRAW);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, sphere_ssbo);
 
     // Upload BVH buffer
@@ -491,15 +591,54 @@ pub fn main() !void {
     glGenBuffers(1, &bvh_ssbo);
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, bvh_ssbo);
     const bvh_header_size = 16;
-    const bvh_buffer_size = bvh_header_size + bvh_nodes.items.len * @sizeOf(GPUBVHNode);
-    const bvh_buffer_data = try allocator.alloc(u8, bvh_buffer_size);
-    defer allocator.free(bvh_buffer_data);
-    const num_nodes: i32 = @intCast(bvh_nodes.items.len);
-    @memcpy(bvh_buffer_data[0..4], std.mem.asBytes(&num_nodes));
-    @memset(bvh_buffer_data[4..16], 0);
-    @memcpy(bvh_buffer_data[bvh_header_size..], std.mem.sliceAsBytes(bvh_nodes.items));
-    glBufferData(GL_SHADER_STORAGE_BUFFER, @intCast(bvh_buffer_size), bvh_buffer_data.ptr, GL_DYNAMIC_DRAW);
+    const bvh_buffer_size = bvh_header_size + MAX_BVH_NODES * @sizeOf(GPUBVHNode);
+    glBufferData(GL_SHADER_STORAGE_BUFFER, @intCast(bvh_buffer_size), null, GL_DYNAMIC_DRAW);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 3, bvh_ssbo);
+
+    // Helper to upload scene data to GPU
+    const uploadScene = struct {
+        fn call(
+            alloc: std.mem.Allocator,
+            sphere_list: *std.ArrayList(GPUSphere),
+            bvh_list: *std.ArrayList(GPUBVHNode),
+            s_ssbo: GLuint,
+            b_ssbo: GLuint,
+        ) !void {
+            // Rebuild BVH
+            bvh_list.clearRetainingCapacity();
+            var idx = try alloc.alloc(u32, sphere_list.items.len);
+            defer alloc.free(idx);
+            for (0..sphere_list.items.len) |i| idx[i] = @intCast(i);
+            _ = try bvh.buildBVH(alloc, sphere_list.items, idx, bvh_list);
+
+            // Upload spheres
+            glBindBuffer(GL_SHADER_STORAGE_BUFFER, s_ssbo);
+            const s_size = sphere_header_size + sphere_list.items.len * @sizeOf(GPUSphere);
+            const s_data = try alloc.alloc(u8, s_size);
+            defer alloc.free(s_data);
+            const num_s: i32 = @intCast(sphere_list.items.len);
+            @memcpy(s_data[0..4], std.mem.asBytes(&num_s));
+            @memset(s_data[4..16], 0);
+            @memcpy(s_data[sphere_header_size..], std.mem.sliceAsBytes(sphere_list.items));
+            glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, @intCast(s_size), s_data.ptr);
+
+            // Upload BVH
+            glBindBuffer(GL_SHADER_STORAGE_BUFFER, b_ssbo);
+            const b_size = bvh_header_size + bvh_list.items.len * @sizeOf(GPUBVHNode);
+            const b_data = try alloc.alloc(u8, b_size);
+            defer alloc.free(b_data);
+            const num_b: i32 = @intCast(bvh_list.items.len);
+            @memcpy(b_data[0..4], std.mem.asBytes(&num_b));
+            @memset(b_data[4..16], 0);
+            @memcpy(b_data[bvh_header_size..], std.mem.sliceAsBytes(bvh_list.items));
+            glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, @intCast(b_size), b_data.ptr);
+
+            std.debug.print("Scene updated: {} spheres, {} BVH nodes\n", .{ sphere_list.items.len, bvh_list.items.len });
+        }
+    }.call;
+
+    // Initial upload
+    try uploadScene(allocator, &spheres, &bvh_nodes, sphere_ssbo, bvh_ssbo);
 
     // Load triangle meshes - try OBJ files first, fallback to procedural
     var triangles = std.ArrayList(GPUTriangle){};
@@ -694,6 +833,34 @@ pub fn main() !void {
     glBufferData(GL_SHADER_STORAGE_BUFFER, @intCast(area_light_buffer_size), area_light_buffer_data.ptr, GL_DYNAMIC_DRAW);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 6, area_light_ssbo);
 
+    // Build per-mesh BVH for instanced rendering (binding 12)
+    // This allows O(log n) triangle intersection instead of O(n)
+    var mesh_bvh_nodes = std.ArrayList(GPUBVHNode){};
+    defer mesh_bvh_nodes.deinit(allocator);
+    var mesh_bvh_root: i32 = -1; // -1 means no BVH, fallback to linear
+
+    if (triangles.items.len > 0) {
+        // Build BVH with RELATIVE indices (0 to N-1)
+        var mesh_indices = try allocator.alloc(u32, triangles.items.len);
+        defer allocator.free(mesh_indices);
+        for (0..triangles.items.len) |i| {
+            mesh_indices[i] = @intCast(i);
+        }
+        mesh_bvh_root = @intCast(try bvh.buildTriangleBVH(allocator, triangles.items, mesh_indices, &mesh_bvh_nodes));
+        std.debug.print("Mesh BVH: {} nodes, root={}\n", .{ mesh_bvh_nodes.items.len, mesh_bvh_root });
+    }
+
+    // Upload mesh BVH buffer (binding 12)
+    var mesh_bvh_ssbo: GLuint = 0;
+    glGenBuffers(1, &mesh_bvh_ssbo);
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, mesh_bvh_ssbo);
+    if (mesh_bvh_nodes.items.len > 0) {
+        glBufferData(GL_SHADER_STORAGE_BUFFER, @intCast(mesh_bvh_nodes.items.len * @sizeOf(GPUBVHNode)), mesh_bvh_nodes.items.ptr, GL_DYNAMIC_DRAW);
+    } else {
+        glBufferData(GL_SHADER_STORAGE_BUFFER, 16, null, GL_DYNAMIC_DRAW);
+    }
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 12, mesh_bvh_ssbo);
+
     // Create mesh instances (example: multiple instances of loaded meshes)
     var instances = std.ArrayList(GPUMeshInstance){};
     defer instances.deinit(allocator);
@@ -719,7 +886,8 @@ pub fn main() !void {
             const rot = types.rotationYMatrix(angle + 3.14159);
             const transform_mat = types.multiplyMatrix(trans, rot);
 
-            try instances.append(allocator, types.createInstance(transform_mat, mesh_start, mesh_end));
+            // Pass mesh_bvh_root so instance uses BVH traversal
+            try instances.append(allocator, types.createInstance(transform_mat, mesh_start, mesh_end, mesh_bvh_root));
         }
     }
 
@@ -954,6 +1122,7 @@ pub fn main() !void {
     const u_holographic_loc = glGetUniformLocation(compute_program, "u_holographic");
     const u_ascii_mode_loc = glGetUniformLocation(compute_program, "u_ascii_mode");
     const u_bokeh_shape_loc = glGetUniformLocation(compute_program, "u_bokeh_shape");
+    const u_debug_mode_loc = glGetUniformLocation(compute_program, "u_debug_mode");
     const u_instance_bvh_root_loc = glGetUniformLocation(compute_program, "u_instance_bvh_root");
 
     g_camera_yaw = std.math.atan2(@as(f32, -3.0), @as(f32, -13.0));
@@ -974,6 +1143,64 @@ pub fn main() !void {
         while (win32.PeekMessageA(&msg, null, 0, 0, win32.PM_REMOVE) != 0) {
             _ = win32.TranslateMessage(&msg);
             _ = win32.DispatchMessageA(&msg);
+        }
+
+        // Handle menu actions that modify the scene
+        if (g_menu_action != 0) {
+            const action = g_menu_action;
+            g_menu_action = 0;
+
+            switch (action) {
+                IDM_SCENE_ADD_SPHERE => {
+                    if (spheres.items.len < MAX_SPHERES) {
+                        const pos = scene.getNextSpawnPosition();
+                        spheres.append(allocator, scene.createDiffuseSphere(pos)) catch {};
+                        g_scene_dirty = true;
+                    }
+                },
+                IDM_SCENE_ADD_METAL => {
+                    if (spheres.items.len < MAX_SPHERES) {
+                        const pos = scene.getNextSpawnPosition();
+                        spheres.append(allocator, scene.createMetalSphere(pos)) catch {};
+                        g_scene_dirty = true;
+                    }
+                },
+                IDM_SCENE_ADD_GLASS => {
+                    if (spheres.items.len < MAX_SPHERES) {
+                        const pos = scene.getNextSpawnPosition();
+                        spheres.append(allocator, scene.createGlassSphere(pos)) catch {};
+                        g_scene_dirty = true;
+                    }
+                },
+                IDM_SCENE_ADD_LIGHT => {
+                    if (spheres.items.len < MAX_SPHERES) {
+                        const pos = scene.getNextSpawnPosition();
+                        spheres.append(allocator, scene.createLightSphere(pos)) catch {};
+                        g_scene_dirty = true;
+                    }
+                },
+                IDM_SCENE_REMOVE_LAST => {
+                    // Don't remove the ground plane (index 0)
+                    if (spheres.items.len > 1) {
+                        _ = spheres.pop();
+                        g_scene_dirty = true;
+                    }
+                },
+                IDM_SCENE_RESET => {
+                    spheres.clearRetainingCapacity();
+                    scene.resetSpawnPosition();
+                    scene.setupScene(allocator, &spheres) catch {};
+                    g_scene_dirty = true;
+                },
+                else => {},
+            }
+        }
+
+        // Rebuild and re-upload scene if modified
+        if (g_scene_dirty) {
+            g_scene_dirty = false;
+            uploadScene(allocator, &spheres, &bvh_nodes, sphere_ssbo, bvh_ssbo) catch {};
+            total_frames = 0; // Reset accumulation
         }
 
         const current_time = std.time.milliTimestamp();
@@ -1005,22 +1232,98 @@ pub fn main() !void {
         const sin_yaw = @sin(g_camera_yaw);
         const cos_pitch = @cos(g_camera_pitch);
         const sin_pitch = @sin(g_camera_pitch);
+        const cos_roll = @cos(g_camera_roll);
+        const sin_roll = @sin(g_camera_roll);
 
-        const forward = Vec3.init(cos_pitch * cos_yaw, sin_pitch, cos_pitch * sin_yaw).normalize();
-        const right = Vec3.init(-sin_yaw, 0, cos_yaw).normalize();
-        const up = right.cross(forward).normalize();
+        // Base forward and right vectors (before roll)
+        const base_forward = Vec3.init(cos_pitch * cos_yaw, sin_pitch, cos_pitch * sin_yaw).normalize();
+        const base_right = Vec3.init(-sin_yaw, 0, cos_yaw).normalize();
+        const base_up = base_right.cross(base_forward).normalize();
+
+        // Apply roll rotation to right and up vectors
+        const forward = base_forward;
+        const right = base_right.scale(cos_roll).add(base_up.scale(sin_roll)).normalize();
+        const up = base_up.scale(cos_roll).sub(base_right.scale(sin_roll)).normalize();
 
         const move_speed: f32 = 8.0 * delta_time;
-        if (g_keys['W']) { g_camera_pos = g_camera_pos.add(forward.scale(move_speed)); camera_moved = true; }
-        if (g_keys['S']) { g_camera_pos = g_camera_pos.add(forward.scale(-move_speed)); camera_moved = true; }
-        if (g_keys['A']) { g_camera_pos = g_camera_pos.add(right.scale(-move_speed)); camera_moved = true; }
-        if (g_keys['D']) { g_camera_pos = g_camera_pos.add(right.scale(move_speed)); camera_moved = true; }
-        if (g_keys[' ']) { g_camera_pos.y += move_speed; camera_moved = true; }
-        if (g_keys[win32.VK_SHIFT]) { g_camera_pos.y -= move_speed; camera_moved = true; }
+
+        // Q/E - Roll control (only in flight mode)
+        if (g_flight_mode) {
+            if (g_keys['Q']) { g_camera_roll -= 2.0 * delta_time; camera_moved = true; }
+            if (g_keys['E']) { g_camera_roll += 2.0 * delta_time; camera_moved = true; }
+        }
+
+        // Movement differs based on camera mode
+        if (g_flight_mode) {
+            // Flight simulator mode: W/S move in the direction you're looking
+            if (g_keys['W']) { g_camera_pos = g_camera_pos.add(forward.scale(move_speed)); camera_moved = true; }
+            if (g_keys['S']) { g_camera_pos = g_camera_pos.add(forward.scale(-move_speed)); camera_moved = true; }
+            if (g_keys['A']) { g_camera_pos = g_camera_pos.add(right.scale(-move_speed)); camera_moved = true; }
+            if (g_keys['D']) { g_camera_pos = g_camera_pos.add(right.scale(move_speed)); camera_moved = true; }
+            // Space/Ctrl move along local up vector (strafe up/down relative to camera)
+            if (g_keys[' ']) { g_camera_pos = g_camera_pos.add(up.scale(move_speed)); camera_moved = true; }
+            if (g_keys[win32.VK_CONTROL]) { g_camera_pos = g_camera_pos.add(up.scale(-move_speed)); camera_moved = true; }
+        } else {
+            // FPS mode: W/S move forward on XZ plane, Space/Ctrl move on Y axis
+            if (g_keys['W']) { g_camera_pos = g_camera_pos.add(forward.scale(move_speed)); camera_moved = true; }
+            if (g_keys['S']) { g_camera_pos = g_camera_pos.add(forward.scale(-move_speed)); camera_moved = true; }
+            if (g_keys['A']) { g_camera_pos = g_camera_pos.add(right.scale(-move_speed)); camera_moved = true; }
+            if (g_keys['D']) { g_camera_pos = g_camera_pos.add(right.scale(move_speed)); camera_moved = true; }
+            if (g_keys[' ']) { g_camera_pos.y += move_speed; camera_moved = true; }
+            if (g_keys[win32.VK_CONTROL]) { g_camera_pos.y -= move_speed; camera_moved = true; }
+        }
         if (g_keys['R']) {
+            // Reset camera
             g_camera_pos = Vec3.init(13, 2, 3);
             g_camera_yaw = std.math.atan2(@as(f32, -3.0), @as(f32, -13.0));
             g_camera_pitch = -0.15;
+            g_camera_roll = 0.0; // Reset roll
+            g_flight_mode = false; // Reset to FPS mode
+            g_debug_mode = 0; // Reset to normal rendering
+            // Reset all effects to defaults
+            g_chromatic_strength = 0.0;
+            g_motion_blur_strength = 0.0;
+            g_bloom_strength = 0.0;
+            g_nee_enabled = true;
+            g_roughness_mult = 1.0;
+            g_exposure = 1.0;
+            g_vignette_strength = 0.3;
+            g_normal_strength = 0.0;
+            g_displacement = 0.0;
+            g_denoise_strength = 0.0;
+            g_fog_density = 0.0;
+            g_film_grain = 0.0;
+            g_dispersion = 0.0;
+            g_lens_flare = 0.0;
+            g_iridescence = 0.0;
+            g_anisotropy = 0.0;
+            g_color_temp = 0.0;
+            g_saturation = 1.0;
+            g_scanlines = 0.0;
+            g_tilt_shift = 0.0;
+            g_glitter = 0.0;
+            g_heat_haze = 0.0;
+            g_kaleidoscope = 0.0;
+            g_pixelate = 0.0;
+            g_edge_detect = 0.0;
+            g_halftone = 0.0;
+            g_night_vision = 0.0;
+            g_thermal = 0.0;
+            g_underwater = 0.0;
+            g_rain_drops = 0.0;
+            g_vhs_effect = 0.0;
+            g_anaglyph_3d = 0.0;
+            g_fisheye = 0.0;
+            g_posterize = 0.0;
+            g_sepia = 0.0;
+            g_frosted = 0.0;
+            g_radial_blur = 0.0;
+            g_dither = 0.0;
+            g_holographic = 0.0;
+            g_ascii_mode = 0.0;
+            g_fov = 20.0;
+            g_aperture = 0.0;
+            g_focus_dist = 10.0;
             camera_moved = true;
             g_keys['R'] = false;
         }
@@ -1051,6 +1354,20 @@ pub fn main() !void {
         if (g_keys['2']) { g_samples_per_frame = 4; g_keys['2'] = false; }
         if (g_keys['3']) { g_samples_per_frame = 8; g_keys['3'] = false; }
         if (g_keys['4']) { g_samples_per_frame = 16; g_keys['4'] = false; }
+
+        // P - Toggle flight mode (pilot mode with roll control)
+        if (g_keys['P']) {
+            g_flight_mode = !g_flight_mode;
+            if (!g_flight_mode) g_camera_roll = 0.0; // Reset roll when exiting flight mode
+            camera_moved = true;
+            g_keys['P'] = false;
+        }
+
+        // 5-8 - Debug visualization modes
+        if (g_keys['5']) { g_debug_mode = 0; camera_moved = true; g_keys['5'] = false; } // Normal
+        if (g_keys['6']) { g_debug_mode = 1; camera_moved = true; g_keys['6'] = false; } // BVH Heatmap
+        if (g_keys['7']) { g_debug_mode = 2; camera_moved = true; g_keys['7'] = false; } // Normals
+        if (g_keys['8']) { g_debug_mode = 3; camera_moved = true; g_keys['8'] = false; } // Depth
 
         // ============ EFFECT CONTROLS ============
         // C - Chromatic aberration (hold Shift for decrease)
@@ -1489,10 +1806,12 @@ pub fn main() !void {
         glUniform1f(u_holographic_loc, g_holographic);
         glUniform1f(u_ascii_mode_loc, g_ascii_mode);
         glUniform1i(u_bokeh_shape_loc, g_bokeh_shape);
+        glUniform1i(u_debug_mode_loc, g_debug_mode);
         glUniform1i(u_instance_bvh_root_loc, -1); // -1 = linear search, no BVH
 
         const groups_x = (RENDER_WIDTH + 15) / 16;
         const groups_y = (RENDER_HEIGHT + 15) / 16;
+
         var sample_idx: u32 = 0;
         while (sample_idx < g_samples_per_frame) : (sample_idx += 1) {
             glUniform1ui(u_sample_loc, sample_idx);
@@ -1500,7 +1819,9 @@ pub fn main() !void {
             glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
         }
 
+        gl.glDisable(gl.GL_BLEND);  // Ensure blending is off BEFORE clear
         gl.glClear(gl.GL_COLOR_BUFFER_BIT);
+        gl.glColor4f(1.0, 1.0, 1.0, 1.0);  // Full opacity for texture
         gl.glEnable(GL_TEXTURE_2D);
         gl.glBindTexture(GL_TEXTURE_2D, output_texture);
         gl.glBegin(gl.GL_QUADS);
@@ -1516,6 +1837,9 @@ pub fn main() !void {
             .aperture = g_aperture,
             .focus_dist = g_focus_dist,
             .samples_per_frame = g_samples_per_frame,
+            .flight_mode = g_flight_mode,
+            .camera_roll = g_camera_roll,
+            .debug_mode = g_debug_mode,
             .bloom_strength = g_bloom_strength,
             .exposure = g_exposure,
             .chromatic_strength = g_chromatic_strength,
@@ -1537,7 +1861,7 @@ pub fn main() !void {
             .halftone = g_halftone,
             .vhs_effect = g_vhs_effect,
             .anaglyph_3d = g_anaglyph_3d,
-        }, g_show_hud);
+        }, g_show_hud); // Press TAB to toggle HUD
 
         _ = win32.SwapBuffers(hdc);
 

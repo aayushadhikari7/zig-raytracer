@@ -94,13 +94,18 @@ pub const GPUMeshInstance = extern struct {
     transform_row1: [4]f32, // Second row
     transform_row2: [4]f32, // Third row
     transform_row3: [4]f32, // Fourth row (translation in xyz, 1 in w)
+    // INVERSE transform matrix (pre-computed to avoid per-ray inversion!)
+    inv_transform_row0: [4]f32,
+    inv_transform_row1: [4]f32,
+    inv_transform_row2: [4]f32,
+    inv_transform_row3: [4]f32,
     // Inverse transpose for normals (upper 3x3)
     normal_row0: [3]f32,
     mesh_start: i32, // Start index in triangle buffer
     normal_row1: [3]f32,
     mesh_end: i32, // End index in triangle buffer
     normal_row2: [3]f32,
-    pad: i32,
+    mesh_bvh_root: i32, // Root index into mesh BVH nodes (-1 if no BVH)
 };
 
 // Rectangular area light for soft shadows
@@ -288,19 +293,82 @@ pub fn normalMatrix(m: [4][4]f32) [3][3]f32 {
     };
 }
 
+// Compute inverse of a 4x4 matrix (for pre-computing instance inverse transforms)
+pub fn inverseMatrix4x4(m: [4][4]f32) [4][4]f32 {
+    const a00 = m[0][0]; const a01 = m[0][1]; const a02 = m[0][2]; const a03 = m[0][3];
+    const a10 = m[1][0]; const a11 = m[1][1]; const a12 = m[1][2]; const a13 = m[1][3];
+    const a20 = m[2][0]; const a21 = m[2][1]; const a22 = m[2][2]; const a23 = m[2][3];
+    const a30 = m[3][0]; const a31 = m[3][1]; const a32 = m[3][2]; const a33 = m[3][3];
+
+    const b00 = a00 * a11 - a01 * a10;
+    const b01 = a00 * a12 - a02 * a10;
+    const b02 = a00 * a13 - a03 * a10;
+    const b03 = a01 * a12 - a02 * a11;
+    const b04 = a01 * a13 - a03 * a11;
+    const b05 = a02 * a13 - a03 * a12;
+    const b06 = a20 * a31 - a21 * a30;
+    const b07 = a20 * a32 - a22 * a30;
+    const b08 = a20 * a33 - a23 * a30;
+    const b09 = a21 * a32 - a22 * a31;
+    const b10 = a21 * a33 - a23 * a31;
+    const b11 = a22 * a33 - a23 * a32;
+
+    const det = b00 * b11 - b01 * b10 + b02 * b09 + b03 * b08 - b04 * b07 + b05 * b06;
+    if (@abs(det) < 0.00001) return .{
+        .{1, 0, 0, 0},
+        .{0, 1, 0, 0},
+        .{0, 0, 1, 0},
+        .{0, 0, 0, 1},
+    };
+
+    const inv_det = 1.0 / det;
+
+    return .{
+        .{
+            (a11 * b11 - a12 * b10 + a13 * b09) * inv_det,
+            (a02 * b10 - a01 * b11 - a03 * b09) * inv_det,
+            (a31 * b05 - a32 * b04 + a33 * b03) * inv_det,
+            (a22 * b04 - a21 * b05 - a23 * b03) * inv_det,
+        },
+        .{
+            (a12 * b08 - a10 * b11 - a13 * b07) * inv_det,
+            (a00 * b11 - a02 * b08 + a03 * b07) * inv_det,
+            (a32 * b02 - a30 * b05 - a33 * b01) * inv_det,
+            (a20 * b05 - a22 * b02 + a23 * b01) * inv_det,
+        },
+        .{
+            (a10 * b10 - a11 * b08 + a13 * b06) * inv_det,
+            (a01 * b08 - a00 * b10 - a03 * b06) * inv_det,
+            (a30 * b04 - a31 * b02 + a33 * b00) * inv_det,
+            (a21 * b02 - a20 * b04 - a23 * b00) * inv_det,
+        },
+        .{
+            (a11 * b07 - a10 * b09 - a12 * b06) * inv_det,
+            (a00 * b09 - a01 * b07 + a02 * b06) * inv_det,
+            (a31 * b01 - a30 * b03 - a32 * b00) * inv_det,
+            (a20 * b03 - a21 * b01 + a22 * b00) * inv_det,
+        },
+    };
+}
+
 // Create a mesh instance from a transform matrix and mesh range
-pub fn createInstance(transform_mat: [4][4]f32, mesh_start: i32, mesh_end: i32) GPUMeshInstance {
+pub fn createInstance(transform_mat: [4][4]f32, mesh_start: i32, mesh_end: i32, mesh_bvh_root: i32) GPUMeshInstance {
     const nm = normalMatrix(transform_mat);
+    const inv = inverseMatrix4x4(transform_mat);
     return .{
         .transform_row0 = transform_mat[0],
         .transform_row1 = transform_mat[1],
         .transform_row2 = transform_mat[2],
         .transform_row3 = transform_mat[3],
+        .inv_transform_row0 = inv[0],
+        .inv_transform_row1 = inv[1],
+        .inv_transform_row2 = inv[2],
+        .inv_transform_row3 = inv[3],
         .normal_row0 = nm[0],
         .mesh_start = mesh_start,
         .normal_row1 = nm[1],
         .mesh_end = mesh_end,
         .normal_row2 = nm[2],
-        .pad = 0,
+        .mesh_bvh_root = mesh_bvh_root,
     };
 }

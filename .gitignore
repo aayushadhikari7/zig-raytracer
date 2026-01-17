@@ -5,6 +5,10 @@ zig-out/
 # Screenshots
 *.bmp
 
+# Scripts
+*.bat
+*.ps1
+
 # IDE
 .vscode/
 .idea/
