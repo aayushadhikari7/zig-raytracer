@@ -2,6 +2,11 @@
 
 A real-time GPU path tracer built in Zig using OpenGL 4.3 compute shaders.
 
+![Raytracer Output](output.png)
+
+> **Warning**
+> This application performs intensive GPU computations. Running at high resolutions or with many effects enabled can cause significant GPU load, high temperatures, and potential system instability. Monitor your GPU temperatures and use quality presets (keys 1-4) to manage performance. **Use at your own risk.**
+
 ## Features
 
 ### Rendering
@@ -19,7 +24,7 @@ A real-time GPU path tracer built in Zig using OpenGL 4.3 compute shaders.
 
 ### Lighting
 - HDR sky with physically-based atmospheric scattering
-- Direct sun lighting with shadows
+- Direct sun lighting
 - Area lights
 - Next Event Estimation (NEE) for faster convergence
 
@@ -40,35 +45,43 @@ A real-time GPU path tracer built in Zig using OpenGL 4.3 compute shaders.
 ## Controls
 
 ### Camera
-- `WASD` - Move camera
-- `Space/Ctrl` - Up/Down
-- `Right-click` - Toggle mouse look
-- `P` - Toggle flight mode
-- `Q/E` - Roll (flight mode only)
+| Key | Action |
+|-----|--------|
+| `WASD` | Move camera |
+| `Space/Ctrl` | Up/Down |
+| `Right-click` | Toggle mouse look |
+| `P` | Toggle flight mode |
+| `Q/E` | Roll (flight mode) |
 
 ### Effects
-- `Shift+Key` - Decrease effect
-- `C` - Chromatic aberration
-- `M` - Motion blur
-- `B` - Bloom
-- `E` - Exposure
-- `V` - Vignette
+| Key | Effect |
+|-----|--------|
+| `Shift+Key` | Decrease effect |
+| `C` | Chromatic aberration |
+| `M` | Motion blur |
+| `B` | Bloom |
+| `E` | Exposure |
+| `V` | Vignette |
 
-### Debug
-- `5` - Normal view
-- `6` - BVH heatmap
-- `7` - Normals visualization
-- `8` - Depth visualization
+### Debug & Quality
+| Key | Action |
+|-----|--------|
+| `1-4` | Quality presets |
+| `5` | Normal view |
+| `6` | BVH heatmap |
+| `7` | Normals visualization |
+| `8` | Depth visualization |
+| `TAB` | Toggle HUD |
+| `R` | Reset all settings |
+| `F12` | Screenshot |
 
-### Other
-- `TAB` - Toggle HUD
-- `R` - Reset all settings
-- `F12` - Screenshot
-- `1-4` - Quality presets
+## Requirements
+
+- **Zig**: 0.15 or later
+- **GPU**: OpenGL 4.3 compatible (NVIDIA GTX 600+, AMD GCN+, Intel HD 5000+)
+- **OS**: Windows (native Win32)
 
 ## Building
-
-Requires Zig 0.15+ and OpenGL 4.3 capable GPU.
 
 ```bash
 zig build -Doptimize=ReleaseFast
@@ -80,7 +93,7 @@ zig build -Doptimize=ReleaseFast
 zig-out/bin/zig-raytracer.exe
 ```
 
-Or place OBJ models in `models/` folder and run from the project directory.
+Place OBJ models in the `models/` folder and run from the project directory.
 
 ## Project Structure
 
@@ -95,15 +108,20 @@ zig-raytracer/
 │   └── effects.zig    # Effect parameters
 ├── models/            # OBJ files
 ├── build.zig          # Build configuration
+├── LICENSE            # MIT License
+├── SECURITY.md        # Security policy
 └── README.md
 ```
 
-## Performance
+## Performance Tips
 
-Optimized for real-time rendering on modern GPUs:
-- Per-mesh BVH for instanced geometry
-- Simplified trace path for interactive framerates
-- Russian roulette path termination
-- Adaptive denoising
+- Use quality presets `1-4` to balance quality vs FPS
+- Lower resolution for better framerates
+- Disable expensive effects (chromatic aberration, motion blur)
+- Monitor GPU temperature during extended use
 
 Tested on RTX 3090 at 1920x1080.
+
+## License
+
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
