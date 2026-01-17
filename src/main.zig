@@ -468,6 +468,42 @@ const compute_shader_source: [*:0]const u8 =
     \\
     \\uniform int u_instance_bvh_root;
     \\
+    \\// CSG primitive - basic shape for CSG operations
+    \\struct CSGPrimitive {
+    \\    vec3 center;
+    \\    int prim_type;  // 0=sphere, 1=box, 2=cylinder, 3=torus
+    \\    vec3 size;      // radius for sphere, half-extents for box
+    \\    float pad0;
+    \\    vec3 rotation;  // euler angles
+    \\    float pad1;
+    \\};
+    \\
+    \\// CSG object - combines primitives with boolean operations
+    \\struct CSGObject {
+    \\    int prim_a;     // First primitive index
+    \\    int prim_b;     // Second primitive index
+    \\    int operation;  // 0=union, 1=intersect, 2=subtract, 3=smooth_union
+    \\    float smooth_k; // Smoothness for smooth ops
+    \\    vec3 albedo;
+    \\    int mat_type;
+    \\    float fuzz;
+    \\    float ior;
+    \\    float emissive;
+    \\    float pad;
+    \\};
+    \\
+    \\layout(std430, binding = 9) buffer CSGPrimitiveBuffer {
+    \\    int num_csg_prims;
+    \\    int csg_prim_pad1, csg_prim_pad2, csg_prim_pad3;
+    \\    CSGPrimitive csg_primitives[];
+    \\};
+    \\
+    \\layout(std430, binding = 10) buffer CSGObjectBuffer {
+    \\    int num_csg_objects;
+    \\    int csg_obj_pad1, csg_obj_pad2, csg_obj_pad3;
+    \\    CSGObject csg_objects[];
+    \\};
+    \\
     \\uint state;
     \\
     \\uint pcg_hash(uint input) {
@@ -566,6 +602,148 @@ const compute_shader_source: [*:0]const u8 =
     \\    return vec3(p, 0.0);
     \\}
     \\
+    \\// ============ CSG / SDF Functions ============
+    \\
+    \\// Rotation matrix from euler angles
+    \\mat3 rotationMatrix(vec3 euler) {
+    \\    float cx = cos(euler.x), sx = sin(euler.x);
+    \\    float cy = cos(euler.y), sy = sin(euler.y);
+    \\    float cz = cos(euler.z), sz = sin(euler.z);
+    \\    return mat3(
+    \\        cy*cz, sx*sy*cz - cx*sz, cx*sy*cz + sx*sz,
+    \\        cy*sz, sx*sy*sz + cx*cz, cx*sy*sz - sx*cz,
+    \\        -sy, sx*cy, cx*cy
+    \\    );
+    \\}
+    \\
+    \\// SDF primitives
+    \\float sdf_sphere(vec3 p, float r) {
+    \\    return length(p) - r;
+    \\}
+    \\
+    \\float sdf_box(vec3 p, vec3 b) {
+    \\    vec3 q = abs(p) - b;
+    \\    return length(max(q, 0.0)) + min(max(q.x, max(q.y, q.z)), 0.0);
+    \\}
+    \\
+    \\float sdf_cylinder(vec3 p, float r, float h) {
+    \\    vec2 d = abs(vec2(length(p.xz), p.y)) - vec2(r, h);
+    \\    return min(max(d.x, d.y), 0.0) + length(max(d, 0.0));
+    \\}
+    \\
+    \\float sdf_torus(vec3 p, vec2 t) {
+    \\    vec2 q = vec2(length(p.xz) - t.x, p.y);
+    \\    return length(q) - t.y;
+    \\}
+    \\
+    \\// Evaluate SDF for a primitive
+    \\float sdf_primitive(vec3 p, int idx) {
+    \\    CSGPrimitive prim = csg_primitives[idx];
+    \\
+    \\    // Transform point to local space
+    \\    mat3 rot = rotationMatrix(prim.rotation);
+    \\    vec3 local_p = transpose(rot) * (p - prim.center);
+    \\
+    \\    if (prim.prim_type == 0) {
+    \\        return sdf_sphere(local_p, prim.size.x);
+    \\    } else if (prim.prim_type == 1) {
+    \\        return sdf_box(local_p, prim.size);
+    \\    } else if (prim.prim_type == 2) {
+    \\        return sdf_cylinder(local_p, prim.size.x, prim.size.y);
+    \\    } else if (prim.prim_type == 3) {
+    \\        return sdf_torus(local_p, prim.size.xy);
+    \\    }
+    \\    return 1e10;
+    \\}
+    \\
+    \\// Boolean operations
+    \\float op_union(float d1, float d2) {
+    \\    return min(d1, d2);
+    \\}
+    \\
+    \\float op_intersect(float d1, float d2) {
+    \\    return max(d1, d2);
+    \\}
+    \\
+    \\float op_subtract(float d1, float d2) {
+    \\    return max(d1, -d2);
+    \\}
+    \\
+    \\float op_smooth_union(float d1, float d2, float k) {
+    \\    float h = clamp(0.5 + 0.5 * (d2 - d1) / k, 0.0, 1.0);
+    \\    return mix(d2, d1, h) - k * h * (1.0 - h);
+    \\}
+    \\
+    \\// Evaluate CSG object SDF
+    \\float sdf_csg_object(vec3 p, int idx) {
+    \\    CSGObject obj = csg_objects[idx];
+    \\    float d1 = sdf_primitive(p, obj.prim_a);
+    \\    float d2 = sdf_primitive(p, obj.prim_b);
+    \\
+    \\    if (obj.operation == 0) return op_union(d1, d2);
+    \\    if (obj.operation == 1) return op_intersect(d1, d2);
+    \\    if (obj.operation == 2) return op_subtract(d1, d2);
+    \\    if (obj.operation == 3) return op_smooth_union(d1, d2, obj.smooth_k);
+    \\    return d1;
+    \\}
+    \\
+    \\// Calculate CSG normal via gradient
+    \\vec3 csg_normal(vec3 p, int idx) {
+    \\    const float eps = 0.001;
+    \\    float d = sdf_csg_object(p, idx);
+    \\    return normalize(vec3(
+    \\        sdf_csg_object(p + vec3(eps, 0, 0), idx) - d,
+    \\        sdf_csg_object(p + vec3(0, eps, 0), idx) - d,
+    \\        sdf_csg_object(p + vec3(0, 0, eps), idx) - d
+    \\    ));
+    \\}
+    \\
+    \\// Ray march CSG object
+    \\bool hit_csg(vec3 ro, vec3 rd, int idx, float t_min, float t_max, out HitRecord rec) {
+    \\    float t = t_min;
+    \\    const int MAX_STEPS = 64;
+    \\    const float EPSILON = 0.001;
+    \\
+    \\    for (int i = 0; i < MAX_STEPS && t < t_max; i++) {
+    \\        vec3 p = ro + rd * t;
+    \\        float d = sdf_csg_object(p, idx);
+    \\
+    \\        if (abs(d) < EPSILON) {
+    \\            CSGObject obj = csg_objects[idx];
+    \\            rec.t = t;
+    \\            rec.point = p;
+    \\            rec.normal = csg_normal(p, idx);
+    \\            rec.front_face = dot(rd, rec.normal) < 0.0;
+    \\            if (!rec.front_face) rec.normal = -rec.normal;
+    \\            rec.sphere_idx = idx;
+    \\            rec.is_triangle = false;
+    \\            rec.is_csg = true;
+    \\            rec.uv = vec2(0.5);
+    \\            rec.texture_id = 0;
+    \\            return true;
+    \\        }
+    \\        t += max(d, EPSILON);
+    \\    }
+    \\    return false;
+    \\}
+    \\
+    \\// Test all CSG objects
+    \\bool hit_csg_objects(vec3 ro, vec3 rd, float t_min, inout float closest, inout HitRecord rec) {
+    \\    if (num_csg_objects == 0) return false;
+    \\
+    \\    bool hit_anything = false;
+    \\    HitRecord temp_rec;
+    \\
+    \\    for (int i = 0; i < num_csg_objects; i++) {
+    \\        if (hit_csg(ro, rd, i, t_min, closest, temp_rec)) {
+    \\            hit_anything = true;
+    \\            closest = temp_rec.t;
+    \\            rec = temp_rec;
+    \\        }
+    \\    }
+    \\    return hit_anything;
+    \\}
+    \\
     \\// Ray-AABB intersection test
     \\bool hit_aabb(vec3 ro, vec3 inv_rd, vec3 box_min, vec3 box_max, float t_max) {
     \\    vec3 t0 = (box_min - ro) * inv_rd;
@@ -584,6 +762,7 @@ const compute_shader_source: [*:0]const u8 =
     \\    bool front_face;
     \\    int sphere_idx;
     \\    bool is_triangle;
+    \\    bool is_csg;
     \\    vec2 uv;
     \\    int texture_id;
     \\};
@@ -609,6 +788,7 @@ const compute_shader_source: [*:0]const u8 =
     \\    rec.normal = rec.front_face ? outward_normal : -outward_normal;
     \\    rec.sphere_idx = idx;
     \\    rec.is_triangle = false;
+    \\    rec.is_csg = false;
     \\    // Spherical UV mapping
     \\    vec3 p = normalize(rec.point - s.center);
     \\    rec.uv = vec2(0.5 + atan(p.z, p.x) / (2.0 * 3.14159265), 0.5 - asin(p.y) / 3.14159265);
@@ -652,6 +832,7 @@ const compute_shader_source: [*:0]const u8 =
     \\    rec.normal = rec.front_face ? interpolated_normal : -interpolated_normal;
     \\    rec.sphere_idx = idx;  // Reuse for triangle index
     \\    rec.is_triangle = true;
+    \\    rec.is_csg = false;
     \\    // Interpolate UV coordinates
     \\    rec.uv = w * tri.uv0 + u * tri.uv1 + v * tri.uv2;
     \\    rec.texture_id = tri.texture_id;
@@ -882,6 +1063,11 @@ const compute_shader_source: [*:0]const u8 =
     \\
     \\    // Check mesh instances
     \\    if (hit_instances(ro, rd, t_min, closest, rec)) {
+    \\        hit_anything = true;
+    \\    }
+    \\
+    \\    // Check CSG objects
+    \\    if (hit_csg_objects(ro, rd, t_min, closest, rec)) {
     \\        hit_anything = true;
     \\    }
     \\
@@ -1412,7 +1598,14 @@ const compute_shader_source: [*:0]const u8 =
     \\            float ior;
     \\            float emissive;
     \\
-    \\            if (rec.is_triangle) {
+    \\            if (rec.is_csg) {
+    \\                CSGObject csg = csg_objects[rec.sphere_idx];
+    \\                mat_type = csg.mat_type;
+    \\                albedo = csg.albedo;
+    \\                fuzz_or_roughness = csg.fuzz;
+    \\                ior = csg.ior;
+    \\                emissive = csg.emissive;
+    \\            } else if (rec.is_triangle) {
     \\                Triangle tri = triangles[rec.sphere_idx];
     \\                mat_type = tri.mat_type;
     \\                albedo = sampleTexture(rec.texture_id, rec.uv, tri.albedo);
@@ -2117,6 +2310,152 @@ pub fn main() !void {
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, instance_bvh_ssbo);
     glBufferData(GL_SHADER_STORAGE_BUFFER, 16, null, GL_DYNAMIC_DRAW);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 8, instance_bvh_ssbo);
+
+    // Create CSG primitives (binding 9)
+    var csg_primitives = std.ArrayList(types.GPUCSGPrimitive).init(allocator);
+    defer csg_primitives.deinit();
+
+    // Create CSG objects (binding 10)
+    var csg_objects = std.ArrayList(types.GPUCSGObject).init(allocator);
+    defer csg_objects.deinit();
+
+    // Demo CSG: Sphere with box subtracted (creates rounded cutout)
+    // Primitive 0: Large sphere
+    try csg_primitives.append(allocator, .{
+        .center = .{ -3.0, 1.5, -3.0 },
+        .prim_type = types.CSG_PRIM_SPHERE,
+        .size = .{ 1.0, 0, 0 },
+        .pad0 = 0,
+        .rotation = .{ 0, 0, 0 },
+        .pad1 = 0,
+    });
+    // Primitive 1: Smaller box for subtraction
+    try csg_primitives.append(allocator, .{
+        .center = .{ -3.0, 1.8, -2.5 },
+        .prim_type = types.CSG_PRIM_BOX,
+        .size = .{ 0.5, 0.5, 0.5 },
+        .pad0 = 0,
+        .rotation = .{ 0.3, 0.5, 0 },
+        .pad1 = 0,
+    });
+
+    // CSG object 0: Sphere - Box (carved sphere)
+    try csg_objects.append(allocator, .{
+        .prim_a = 0,
+        .prim_b = 1,
+        .operation = types.CSG_OP_SUBTRACT,
+        .smooth_k = 0.1,
+        .albedo = .{ 0.9, 0.2, 0.3 }, // Red
+        .mat_type = 0, // Diffuse
+        .fuzz = 0,
+        .ior = 0,
+        .emissive = 0,
+        .pad = 0,
+    });
+
+    // Demo CSG 2: Smooth union of two spheres (organic blob)
+    // Primitive 2: First blob sphere
+    try csg_primitives.append(allocator, .{
+        .center = .{ 3.0, 0.8, -3.0 },
+        .prim_type = types.CSG_PRIM_SPHERE,
+        .size = .{ 0.7, 0, 0 },
+        .pad0 = 0,
+        .rotation = .{ 0, 0, 0 },
+        .pad1 = 0,
+    });
+    // Primitive 3: Second blob sphere
+    try csg_primitives.append(allocator, .{
+        .center = .{ 3.5, 1.2, -2.8 },
+        .prim_type = types.CSG_PRIM_SPHERE,
+        .size = .{ 0.5, 0, 0 },
+        .pad0 = 0,
+        .rotation = .{ 0, 0, 0 },
+        .pad1 = 0,
+    });
+
+    // CSG object 1: Smooth union blob
+    try csg_objects.append(allocator, .{
+        .prim_a = 2,
+        .prim_b = 3,
+        .operation = types.CSG_OP_SMOOTH_UNION,
+        .smooth_k = 0.3,
+        .albedo = .{ 0.2, 0.8, 0.4 }, // Green
+        .mat_type = 1, // Metal
+        .fuzz = 0.1,
+        .ior = 0,
+        .emissive = 0,
+        .pad = 0,
+    });
+
+    // Demo CSG 3: Box intersected with sphere (rounded cube)
+    // Primitive 4: Box
+    try csg_primitives.append(allocator, .{
+        .center = .{ 0.0, 0.8, -6.0 },
+        .prim_type = types.CSG_PRIM_BOX,
+        .size = .{ 0.7, 0.7, 0.7 },
+        .pad0 = 0,
+        .rotation = .{ 0.2, 0.4, 0 },
+        .pad1 = 0,
+    });
+    // Primitive 5: Slightly larger sphere
+    try csg_primitives.append(allocator, .{
+        .center = .{ 0.0, 0.8, -6.0 },
+        .prim_type = types.CSG_PRIM_SPHERE,
+        .size = .{ 0.9, 0, 0 },
+        .pad0 = 0,
+        .rotation = .{ 0, 0, 0 },
+        .pad1 = 0,
+    });
+
+    // CSG object 2: Box intersect Sphere (rounded cube)
+    try csg_objects.append(allocator, .{
+        .prim_a = 4,
+        .prim_b = 5,
+        .operation = types.CSG_OP_INTERSECT,
+        .smooth_k = 0,
+        .albedo = .{ 0.95, 0.95, 1.0 }, // Glass-like
+        .mat_type = 2, // Glass
+        .fuzz = 0,
+        .ior = 1.5,
+        .emissive = 0,
+        .pad = 0,
+    });
+
+    std.debug.print("CSG primitives: {}, CSG objects: {}\n", .{ csg_primitives.items.len, csg_objects.items.len });
+
+    // Upload CSG primitive buffer (binding 9)
+    var csg_prim_ssbo: GLuint = 0;
+    glGenBuffers(1, &csg_prim_ssbo);
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, csg_prim_ssbo);
+    const csg_prim_header_size = 16;
+    const csg_prim_buffer_size = csg_prim_header_size + csg_primitives.items.len * @sizeOf(types.GPUCSGPrimitive);
+    const csg_prim_buffer_data = try allocator.alloc(u8, csg_prim_buffer_size);
+    defer allocator.free(csg_prim_buffer_data);
+    const num_csg_prims: i32 = @intCast(csg_primitives.items.len);
+    @memcpy(csg_prim_buffer_data[0..4], std.mem.asBytes(&num_csg_prims));
+    @memset(csg_prim_buffer_data[4..16], 0);
+    if (csg_primitives.items.len > 0) {
+        @memcpy(csg_prim_buffer_data[csg_prim_header_size..], std.mem.sliceAsBytes(csg_primitives.items));
+    }
+    glBufferData(GL_SHADER_STORAGE_BUFFER, @intCast(csg_prim_buffer_size), csg_prim_buffer_data.ptr, GL_DYNAMIC_DRAW);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 9, csg_prim_ssbo);
+
+    // Upload CSG object buffer (binding 10)
+    var csg_obj_ssbo: GLuint = 0;
+    glGenBuffers(1, &csg_obj_ssbo);
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, csg_obj_ssbo);
+    const csg_obj_header_size = 16;
+    const csg_obj_buffer_size = csg_obj_header_size + csg_objects.items.len * @sizeOf(types.GPUCSGObject);
+    const csg_obj_buffer_data = try allocator.alloc(u8, csg_obj_buffer_size);
+    defer allocator.free(csg_obj_buffer_data);
+    const num_csg_objs: i32 = @intCast(csg_objects.items.len);
+    @memcpy(csg_obj_buffer_data[0..4], std.mem.asBytes(&num_csg_objs));
+    @memset(csg_obj_buffer_data[4..16], 0);
+    if (csg_objects.items.len > 0) {
+        @memcpy(csg_obj_buffer_data[csg_obj_header_size..], std.mem.sliceAsBytes(csg_objects.items));
+    }
+    glBufferData(GL_SHADER_STORAGE_BUFFER, @intCast(csg_obj_buffer_size), csg_obj_buffer_data.ptr, GL_DYNAMIC_DRAW);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 10, csg_obj_ssbo);
 
     const u_camera_pos_loc = glGetUniformLocation(compute_program, "u_camera_pos");
     const u_camera_forward_loc = glGetUniformLocation(compute_program, "u_camera_forward");

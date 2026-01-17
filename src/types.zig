@@ -47,6 +47,45 @@ pub const GPUBVHNode = extern struct {
     right_child: i32, // sphere/triangle index if leaf
 };
 
+// CSG primitive types
+pub const CSG_PRIM_SPHERE: i32 = 0;
+pub const CSG_PRIM_BOX: i32 = 1;
+pub const CSG_PRIM_CYLINDER: i32 = 2;
+pub const CSG_PRIM_TORUS: i32 = 3;
+
+// CSG operation types
+pub const CSG_OP_UNION: i32 = 0;
+pub const CSG_OP_INTERSECT: i32 = 1;
+pub const CSG_OP_SUBTRACT: i32 = 2;
+pub const CSG_OP_SMOOTH_UNION: i32 = 3;
+
+// CSG primitive - basic shape for CSG operations
+pub const GPUCSGPrimitive = extern struct {
+    // Position and size
+    center: [3]f32,
+    prim_type: i32, // 0=sphere, 1=box, 2=cylinder, 3=torus
+    size: [3]f32, // radius for sphere, half-extents for box, (radius, height, 0) for cylinder
+    pad0: f32,
+    // Rotation (euler angles in radians)
+    rotation: [3]f32,
+    pad1: f32,
+};
+
+// CSG object - combines primitives with boolean operations
+pub const GPUCSGObject = extern struct {
+    prim_a: i32, // Index of first primitive (or -1 if referencing another CSG object)
+    prim_b: i32, // Index of second primitive
+    operation: i32, // 0=union, 1=intersect, 2=subtract, 3=smooth_union
+    smooth_k: f32, // Smoothness factor for smooth operations
+    // Material properties
+    albedo: [3]f32,
+    mat_type: i32,
+    fuzz: f32,
+    ior: f32,
+    emissive: f32,
+    pad: f32,
+};
+
 // Mesh instance for instanced rendering
 // Contains a 4x4 transform matrix and mesh reference
 pub const GPUMeshInstance = extern struct {
