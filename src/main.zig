@@ -515,16 +515,40 @@ const compute_shader_source: [*:0]const u8 =
     \\    return true;
     \\}
     \\
-    \\// Test all triangles (simple linear traversal for now)
+    \\// Triangle BVH traversal
     \\bool hit_triangles(vec3 ro, vec3 rd, float t_min, float t_max, inout HitRecord rec, inout float closest) {
+    \\    if (num_triangles == 0 || num_tri_nodes == 0) return false;
+    \\
+    \\    vec3 inv_rd = 1.0 / rd;
+    \\    int stack[BVH_STACK_SIZE];
+    \\    int stack_ptr = 0;
+    \\    stack[stack_ptr++] = 0;
+    \\
     \\    bool hit_anything = false;
     \\    HitRecord temp_rec;
     \\
-    \\    for (int i = 0; i < num_triangles; i++) {
-    \\        if (hit_triangle(ro, rd, i, t_min, closest, temp_rec)) {
-    \\            hit_anything = true;
-    \\            closest = temp_rec.t;
-    \\            rec = temp_rec;
+    \\    while (stack_ptr > 0) {
+    \\        int node_idx = stack[--stack_ptr];
+    \\        BVHNode node = tri_nodes[node_idx];
+    \\
+    \\        if (!hit_aabb(ro, inv_rd, node.aabb_min, node.aabb_max, closest)) {
+    \\            continue;
+    \\        }
+    \\
+    \\        if (node.left_child == -1) {
+    \\            // Leaf node - test triangle
+    \\            int tri_idx = node.right_child;
+    \\            if (hit_triangle(ro, rd, tri_idx, t_min, closest, temp_rec)) {
+    \\                hit_anything = true;
+    \\                closest = temp_rec.t;
+    \\                rec = temp_rec;
+    \\            }
+    \\        } else {
+    \\            // Interior node - push children
+    \\            if (stack_ptr < BVH_STACK_SIZE - 1) {
+    \\                stack[stack_ptr++] = node.right_child;
+    \\                stack[stack_ptr++] = node.left_child;
+    \\            }
     \\        }
     \\    }
     \\
@@ -1226,6 +1250,20 @@ const AABB = struct {
         self.expand(Vec3.init(center.x + radius, center.y + radius, center.z + radius));
     }
 
+    fn expandTriangle(self: *AABB, tri: GPUTriangle) void {
+        self.expand(Vec3.init(tri.v0[0], tri.v0[1], tri.v0[2]));
+        self.expand(Vec3.init(tri.v1[0], tri.v1[1], tri.v1[2]));
+        self.expand(Vec3.init(tri.v2[0], tri.v2[1], tri.v2[2]));
+    }
+
+    fn triangleCenter(tri: GPUTriangle) Vec3 {
+        return Vec3.init(
+            (tri.v0[0] + tri.v1[0] + tri.v2[0]) / 3.0,
+            (tri.v0[1] + tri.v1[1] + tri.v2[1]) / 3.0,
+            (tri.v0[2] + tri.v1[2] + tri.v2[2]) / 3.0,
+        );
+    }
+
     fn merge(a: AABB, b: AABB) AABB {
         return .{
             .min = Vec3.init(@min(a.min.x, b.min.x), @min(a.min.y, b.min.y), @min(a.min.z, b.min.z)),
@@ -1294,6 +1332,90 @@ fn buildBVH(
     const mid = indices.len / 2;
     const left_idx = try buildBVH(allocator, spheres, indices[0..mid], nodes);
     const right_idx = try buildBVH(allocator, spheres, indices[mid..], nodes);
+
+    // Merge bounds from children
+    const left_node = nodes.items[left_idx];
+    const right_node = nodes.items[right_idx];
+    const left_aabb = AABB{
+        .min = Vec3.init(left_node.aabb_min[0], left_node.aabb_min[1], left_node.aabb_min[2]),
+        .max = Vec3.init(left_node.aabb_max[0], left_node.aabb_max[1], left_node.aabb_max[2]),
+    };
+    const right_aabb = AABB{
+        .min = Vec3.init(right_node.aabb_min[0], right_node.aabb_min[1], right_node.aabb_min[2]),
+        .max = Vec3.init(right_node.aabb_max[0], right_node.aabb_max[1], right_node.aabb_max[2]),
+    };
+    const merged = AABB.merge(left_aabb, right_aabb);
+
+    nodes.items[node_idx] = .{
+        .aabb_min = .{ merged.min.x, merged.min.y, merged.min.z },
+        .left_child = @intCast(left_idx),
+        .aabb_max = .{ merged.max.x, merged.max.y, merged.max.z },
+        .right_child = @intCast(right_idx),
+    };
+
+    return node_idx;
+}
+
+fn buildTriangleBVH(
+    allocator: std.mem.Allocator,
+    triangles: []const GPUTriangle,
+    indices: []u32,
+    nodes: *std.ArrayList(GPUBVHNode),
+) !u32 {
+    const node_idx: u32 = @intCast(nodes.items.len);
+    try nodes.append(allocator, undefined);
+
+    if (indices.len == 1) {
+        // Leaf node
+        var aabb = AABB.empty();
+        aabb.expandTriangle(triangles[indices[0]]);
+
+        nodes.items[node_idx] = .{
+            .aabb_min = .{ aabb.min.x, aabb.min.y, aabb.min.z },
+            .left_child = -1,
+            .aabb_max = .{ aabb.max.x, aabb.max.y, aabb.max.z },
+            .right_child = @intCast(indices[0]),
+        };
+        return node_idx;
+    }
+
+    // Compute bounding box of all triangles
+    var bounds = AABB.empty();
+    for (indices) |idx| {
+        bounds.expandTriangle(triangles[idx]);
+    }
+
+    // Find longest axis
+    const extent = Vec3.init(
+        bounds.max.x - bounds.min.x,
+        bounds.max.y - bounds.min.y,
+        bounds.max.z - bounds.min.z,
+    );
+    var axis: usize = 0;
+    if (extent.y > extent.x) axis = 1;
+    if (extent.z > (if (axis == 0) extent.x else extent.y)) axis = 2;
+
+    // Sort by centroid along axis
+    const SortContext = struct {
+        triangles: []const GPUTriangle,
+        axis: usize,
+    };
+    const ctx = SortContext{ .triangles = triangles, .axis = axis };
+
+    std.mem.sort(u32, indices, ctx, struct {
+        fn lessThan(c: SortContext, a: u32, b: u32) bool {
+            const ta = c.triangles[a];
+            const tb = c.triangles[b];
+            const ca = (ta.v0[c.axis] + ta.v1[c.axis] + ta.v2[c.axis]) / 3.0;
+            const cb = (tb.v0[c.axis] + tb.v1[c.axis] + tb.v2[c.axis]) / 3.0;
+            return ca < cb;
+        }
+    }.lessThan);
+
+    // Split in half
+    const mid = indices.len / 2;
+    const left_idx = try buildTriangleBVH(allocator, triangles, indices[0..mid], nodes);
+    const right_idx = try buildTriangleBVH(allocator, triangles, indices[mid..], nodes);
 
     // Merge bounds from children
     const left_node = nodes.items[left_idx];
@@ -1552,6 +1674,36 @@ pub fn main() !void {
     @memcpy(tri_buffer_data[tri_header_size..], std.mem.sliceAsBytes(triangles.items));
     glBufferData(GL_SHADER_STORAGE_BUFFER, @intCast(tri_buffer_size), tri_buffer_data.ptr, GL_DYNAMIC_DRAW);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 4, triangle_ssbo);
+
+    // Build and upload triangle BVH
+    var tri_bvh_nodes = std.ArrayList(GPUBVHNode).init(allocator);
+    defer tri_bvh_nodes.deinit();
+
+    if (triangles.items.len > 0) {
+        var tri_indices = try allocator.alloc(u32, triangles.items.len);
+        defer allocator.free(tri_indices);
+        for (0..triangles.items.len) |i| {
+            tri_indices[i] = @intCast(i);
+        }
+        _ = try buildTriangleBVH(allocator, triangles.items, tri_indices, &tri_bvh_nodes);
+        std.debug.print("Triangle BVH: {} nodes\n", .{tri_bvh_nodes.items.len});
+    }
+
+    var tri_bvh_ssbo: GLuint = 0;
+    glGenBuffers(1, &tri_bvh_ssbo);
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, tri_bvh_ssbo);
+    const tri_bvh_header_size = 16;
+    const tri_bvh_buffer_size = tri_bvh_header_size + tri_bvh_nodes.items.len * @sizeOf(GPUBVHNode);
+    const tri_bvh_buffer_data = try allocator.alloc(u8, tri_bvh_buffer_size);
+    defer allocator.free(tri_bvh_buffer_data);
+    const num_tri_nodes: i32 = @intCast(tri_bvh_nodes.items.len);
+    @memcpy(tri_bvh_buffer_data[0..4], std.mem.asBytes(&num_tri_nodes));
+    @memset(tri_bvh_buffer_data[4..16], 0);
+    if (tri_bvh_nodes.items.len > 0) {
+        @memcpy(tri_bvh_buffer_data[tri_bvh_header_size..], std.mem.sliceAsBytes(tri_bvh_nodes.items));
+    }
+    glBufferData(GL_SHADER_STORAGE_BUFFER, @intCast(tri_bvh_buffer_size), tri_bvh_buffer_data.ptr, GL_DYNAMIC_DRAW);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 5, tri_bvh_ssbo);
 
     const u_camera_pos_loc = glGetUniformLocation(compute_program, "u_camera_pos");
     const u_camera_forward_loc = glGetUniformLocation(compute_program, "u_camera_forward");
