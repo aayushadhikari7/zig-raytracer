@@ -1,0 +1,12 @@
+.{
+    .name = .zig_raytracer,
+    .version = "0.1.0",
+    .fingerprint = 0xcc1b1cdcbb72572b,
+    .minimum_zig_version = "0.15.2",
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}
