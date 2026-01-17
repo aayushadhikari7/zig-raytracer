@@ -47,6 +47,20 @@ pub const GPUBVHNode = extern struct {
     right_child: i32, // sphere/triangle index if leaf
 };
 
+// Rectangular area light for soft shadows
+pub const GPUAreaLight = extern struct {
+    position: [3]f32, // Corner position
+    pad0: f32,
+    u_vec: [3]f32, // First edge vector
+    pad1: f32,
+    v_vec: [3]f32, // Second edge vector
+    pad2: f32,
+    normal: [3]f32, // Light normal (pointing outward)
+    area: f32, // Pre-computed area for PDF
+    color: [3]f32, // Light color
+    intensity: f32, // Light intensity
+};
+
 // ============================================================================
 // AABB - Axis-Aligned Bounding Box for BVH construction
 // ============================================================================

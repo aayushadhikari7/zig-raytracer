@@ -8,6 +8,7 @@ const scene = @import("scene.zig");
 const GPUSphere = types.GPUSphere;
 const GPUTriangle = types.GPUTriangle;
 const GPUBVHNode = types.GPUBVHNode;
+const GPUAreaLight = types.GPUAreaLight;
 
 const win32 = @cImport({
     @cDefine("WIN32_LEAN_AND_MEAN", "1");
@@ -420,6 +421,26 @@ const compute_shader_source: [*:0]const u8 =
     \\    BVHNode tri_nodes[];
     \\};
     \\
+    \\// Area light for soft shadows
+    \\struct AreaLight {
+    \\    vec3 position;   // Corner position
+    \\    float pad0;
+    \\    vec3 u_vec;      // First edge vector
+    \\    float pad1;
+    \\    vec3 v_vec;      // Second edge vector
+    \\    float pad2;
+    \\    vec3 normal;     // Light facing direction
+    \\    float area;      // Pre-computed area
+    \\    vec3 color;      // Light color
+    \\    float intensity; // Light intensity
+    \\};
+    \\
+    \\layout(std430, binding = 6) buffer AreaLightBuffer {
+    \\    int num_area_lights;
+    \\    int area_pad1, area_pad2, area_pad3;
+    \\    AreaLight area_lights[];
+    \\};
+    \\
     \\uint state;
     \\
     \\uint pcg_hash(uint input) {
@@ -785,6 +806,42 @@ const compute_shader_source: [*:0]const u8 =
     \\        float cosThetaSample = max(0.0, dot(normal, sampleDir));
     \\        vec3 lightContrib = albedo * light.albedo * light.emissive;
     \\        direct += lightContrib * cosThetaSample * solidAngle / PI;
+    \\    }
+    \\
+    \\    // Sample rectangular area lights for soft shadows
+    \\    for (int i = 0; i < num_area_lights; i++) {
+    \\        AreaLight alight = area_lights[i];
+    \\
+    \\        // Sample random point on the light surface
+    \\        float u = rand();
+    \\        float v = rand();
+    \\        vec3 lightPoint = alight.position + alight.u_vec * u + alight.v_vec * v;
+    \\
+    \\        // Direction and distance to sampled point
+    \\        vec3 toLight = lightPoint - point;
+    \\        float dist2 = dot(toLight, toLight);
+    \\        float dist = sqrt(dist2);
+    \\        vec3 lightDir = toLight / dist;
+    \\
+    \\        // Check if light is in front of surface
+    \\        float cosTheta = dot(normal, lightDir);
+    \\        if (cosTheta <= 0.0) continue;
+    \\
+    \\        // Check if we're on the emitting side of the light
+    \\        float cosLight = -dot(alight.normal, lightDir);
+    \\        if (cosLight <= 0.0) continue;
+    \\
+    \\        // Shadow ray
+    \\        HitRecord shadowRec;
+    \\        if (hit_world_bvh(point + normal * 0.002, lightDir, 0.001, dist - 0.01, shadowRec)) {
+    \\            continue;  // Occluded
+    \\        }
+    \\
+    \\        // Area light contribution with proper geometric term
+    \\        // PDF = 1/area, geometric term = cos(theta) * cos(theta_light) / dist^2
+    \\        float geometricTerm = cosTheta * cosLight / dist2;
+    \\        vec3 lightContrib = albedo * alight.color * alight.intensity * alight.area;
+    \\        direct += lightContrib * geometricTerm / PI;
     \\    }
     \\
     \\    return direct;
@@ -1678,6 +1735,71 @@ pub fn main() !void {
     }
     glBufferData(GL_SHADER_STORAGE_BUFFER, @intCast(tri_bvh_buffer_size), tri_bvh_buffer_data.ptr, GL_DYNAMIC_DRAW);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 5, tri_bvh_ssbo);
+
+    // Create area lights for soft shadows
+    var area_lights = std.ArrayList(GPUAreaLight).init(allocator);
+    defer area_lights.deinit();
+
+    // Large overhead rectangular light (studio lighting style)
+    try area_lights.append(.{
+        .position = .{ -3.0, 8.0, -3.0 },
+        .pad0 = 0,
+        .u_vec = .{ 6.0, 0.0, 0.0 }, // 6 units wide
+        .pad1 = 0,
+        .v_vec = .{ 0.0, 0.0, 6.0 }, // 6 units deep
+        .pad2 = 0,
+        .normal = .{ 0.0, -1.0, 0.0 }, // Pointing down
+        .area = 36.0, // 6 * 6
+        .color = .{ 1.0, 0.95, 0.9 }, // Warm white
+        .intensity = 8.0,
+    });
+
+    // Blue accent light on the left
+    try area_lights.append(.{
+        .position = .{ -10.0, 2.0, -2.0 },
+        .pad0 = 0,
+        .u_vec = .{ 0.0, 3.0, 0.0 }, // 3 units tall
+        .pad1 = 0,
+        .v_vec = .{ 0.0, 0.0, 4.0 }, // 4 units deep
+        .pad2 = 0,
+        .normal = .{ 1.0, 0.0, 0.0 }, // Pointing right
+        .area = 12.0, // 3 * 4
+        .color = .{ 0.3, 0.5, 1.0 }, // Blue
+        .intensity = 5.0,
+    });
+
+    // Orange rim light on the right
+    try area_lights.append(.{
+        .position = .{ 10.0, 1.0, 0.0 },
+        .pad0 = 0,
+        .u_vec = .{ 0.0, 2.0, 0.0 }, // 2 units tall
+        .pad1 = 0,
+        .v_vec = .{ 0.0, 0.0, 3.0 }, // 3 units deep
+        .pad2 = 0,
+        .normal = .{ -1.0, 0.0, 0.0 }, // Pointing left
+        .area = 6.0, // 2 * 3
+        .color = .{ 1.0, 0.6, 0.3 }, // Orange
+        .intensity = 4.0,
+    });
+
+    std.debug.print("Area lights: {}\n", .{area_lights.items.len});
+
+    // Upload area light buffer
+    var area_light_ssbo: GLuint = 0;
+    glGenBuffers(1, &area_light_ssbo);
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, area_light_ssbo);
+    const area_light_header_size = 16;
+    const area_light_buffer_size = area_light_header_size + area_lights.items.len * @sizeOf(GPUAreaLight);
+    const area_light_buffer_data = try allocator.alloc(u8, area_light_buffer_size);
+    defer allocator.free(area_light_buffer_data);
+    const num_area_lights: i32 = @intCast(area_lights.items.len);
+    @memcpy(area_light_buffer_data[0..4], std.mem.asBytes(&num_area_lights));
+    @memset(area_light_buffer_data[4..16], 0);
+    if (area_lights.items.len > 0) {
+        @memcpy(area_light_buffer_data[area_light_header_size..], std.mem.sliceAsBytes(area_lights.items));
+    }
+    glBufferData(GL_SHADER_STORAGE_BUFFER, @intCast(area_light_buffer_size), area_light_buffer_data.ptr, GL_DYNAMIC_DRAW);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 6, area_light_ssbo);
 
     const u_camera_pos_loc = glGetUniformLocation(compute_program, "u_camera_pos");
     const u_camera_forward_loc = glGetUniformLocation(compute_program, "u_camera_forward");
