@@ -138,6 +138,15 @@ var g_samples_per_frame: u32 = 8;
 var g_save_screenshot: bool = false;
 var g_show_help: bool = true;
 
+// Effect controls
+var g_chromatic_strength: f32 = 0.003;
+var g_motion_blur_strength: f32 = 0.5;
+var g_bloom_strength: f32 = 0.15;
+var g_nee_enabled: bool = true;
+var g_roughness_mult: f32 = 1.0;
+var g_exposure: f32 = 1.0;
+var g_vignette_strength: f32 = 0.15;
+
 fn windowProc(hwnd: win32.HWND, msg: c_uint, wparam: win32.WPARAM, lparam: win32.LPARAM) callconv(std.builtin.CallingConvention.c) win32.LRESULT {
     switch (msg) {
         win32.WM_DESTROY, win32.WM_CLOSE => {
@@ -308,6 +317,8 @@ const compute_shader_source: [*:0]const u8 =
     \\uniform vec3 u_camera_forward;
     \\uniform vec3 u_camera_right;
     \\uniform vec3 u_camera_up;
+    \\uniform vec3 u_prev_camera_pos;
+    \\uniform vec3 u_prev_camera_forward;
     \\uniform float u_fov_scale;
     \\uniform float u_aperture;
     \\uniform float u_focus_dist;
@@ -316,6 +327,15 @@ const compute_shader_source: [*:0]const u8 =
     \\uniform int u_width;
     \\uniform int u_height;
     \\uniform float u_aspect;
+    \\
+    \\// Effect controls
+    \\uniform float u_chromatic;
+    \\uniform float u_motion_blur;
+    \\uniform float u_bloom;
+    \\uniform float u_nee;
+    \\uniform float u_roughness_mult;
+    \\uniform float u_exposure;
+    \\uniform float u_vignette;
     \\
     \\#define MAX_DEPTH 16
     \\#define BVH_STACK_SIZE 64
@@ -348,6 +368,29 @@ const compute_shader_source: [*:0]const u8 =
     \\    int num_nodes;
     \\    int bvh_pad1, bvh_pad2, bvh_pad3;
     \\    BVHNode nodes[];
+    \\};
+    \\
+    \\struct Triangle {
+    \\    vec3 v0;
+    \\    int mat_type;
+    \\    vec3 v1;
+    \\    float pad1;
+    \\    vec3 v2;
+    \\    float pad2;
+    \\    vec3 n0;
+    \\    float pad3;
+    \\    vec3 n1;
+    \\    float pad4;
+    \\    vec3 n2;
+    \\    float pad5;
+    \\    vec3 albedo;
+    \\    float emissive;
+    \\};
+    \\
+    \\layout(std430, binding = 4) buffer TriangleBuffer {
+    \\    int num_triangles;
+    \\    int tri_pad1, tri_pad2, tri_pad3;
+    \\    Triangle triangles[];
     \\};
     \\
     \\uint state;
@@ -400,6 +443,7 @@ const compute_shader_source: [*:0]const u8 =
     \\    float t;
     \\    bool front_face;
     \\    int sphere_idx;
+    \\    bool is_triangle;
     \\};
     \\
     \\bool hit_sphere(vec3 ro, vec3 rd, int idx, float t_min, float t_max, out HitRecord rec) {
@@ -422,7 +466,63 @@ const compute_shader_source: [*:0]const u8 =
     \\    rec.front_face = dot(rd, outward_normal) < 0.0;
     \\    rec.normal = rec.front_face ? outward_normal : -outward_normal;
     \\    rec.sphere_idx = idx;
+    \\    rec.is_triangle = false;
     \\    return true;
+    \\}
+    \\
+    \\// Möller-Trumbore triangle intersection
+    \\bool hit_triangle(vec3 ro, vec3 rd, int idx, float t_min, float t_max, out HitRecord rec) {
+    \\    Triangle tri = triangles[idx];
+    \\    vec3 edge1 = tri.v1 - tri.v0;
+    \\    vec3 edge2 = tri.v2 - tri.v0;
+    \\    vec3 h = cross(rd, edge2);
+    \\    float a = dot(edge1, h);
+    \\
+    \\    if (abs(a) < 0.0001) return false;  // Ray parallel to triangle
+    \\
+    \\    float f = 1.0 / a;
+    \\    vec3 s = ro - tri.v0;
+    \\    float u = f * dot(s, h);
+    \\
+    \\    if (u < 0.0 || u > 1.0) return false;
+    \\
+    \\    vec3 q = cross(s, edge1);
+    \\    float v = f * dot(rd, q);
+    \\
+    \\    if (v < 0.0 || u + v > 1.0) return false;
+    \\
+    \\    float t = f * dot(edge2, q);
+    \\
+    \\    if (t <= t_min || t >= t_max) return false;
+    \\
+    \\    rec.t = t;
+    \\    rec.point = ro + rd * t;
+    \\
+    \\    // Interpolate normal using barycentric coordinates
+    \\    float w = 1.0 - u - v;
+    \\    vec3 interpolated_normal = normalize(w * tri.n0 + u * tri.n1 + v * tri.n2);
+    \\
+    \\    rec.front_face = dot(rd, interpolated_normal) < 0.0;
+    \\    rec.normal = rec.front_face ? interpolated_normal : -interpolated_normal;
+    \\    rec.sphere_idx = idx;  // Reuse for triangle index
+    \\    rec.is_triangle = true;
+    \\    return true;
+    \\}
+    \\
+    \\// Test all triangles (simple linear traversal for now)
+    \\bool hit_triangles(vec3 ro, vec3 rd, float t_min, float t_max, inout HitRecord rec, inout float closest) {
+    \\    bool hit_anything = false;
+    \\    HitRecord temp_rec;
+    \\
+    \\    for (int i = 0; i < num_triangles; i++) {
+    \\        if (hit_triangle(ro, rd, i, t_min, closest, temp_rec)) {
+    \\            hit_anything = true;
+    \\            closest = temp_rec.t;
+    \\            rec = temp_rec;
+    \\        }
+    \\    }
+    \\
+    \\    return hit_anything;
     \\}
     \\
     \\// BVH traversal using stack
@@ -460,6 +560,12 @@ const compute_shader_source: [*:0]const u8 =
     \\            }
     \\        }
     \\    }
+    \\
+    \\    // Also check triangles
+    \\    if (hit_triangles(ro, rd, t_min, closest, rec, closest)) {
+    \\        hit_anything = true;
+    \\    }
+    \\
     \\    return hit_anything;
     \\}
     \\
@@ -467,6 +573,58 @@ const compute_shader_source: [*:0]const u8 =
     \\    float r0 = (1.0 - ior) / (1.0 + ior);
     \\    r0 = r0 * r0;
     \\    return r0 + (1.0 - r0) * pow(1.0 - cosine, 5.0);
+    \\}
+    \\
+    \\// ========== GGX/Cook-Torrance BRDF ==========
+    \\const float PI = 3.14159265359;
+    \\
+    \\// GGX Normal Distribution Function
+    \\float DistributionGGX(vec3 N, vec3 H, float roughness) {
+    \\    float a = roughness * roughness;
+    \\    float a2 = a * a;
+    \\    float NdotH = max(dot(N, H), 0.0);
+    \\    float NdotH2 = NdotH * NdotH;
+    \\    float nom = a2;
+    \\    float denom = (NdotH2 * (a2 - 1.0) + 1.0);
+    \\    denom = PI * denom * denom;
+    \\    return nom / max(denom, 0.0001);
+    \\}
+    \\
+    \\// Geometry function (Schlick-GGX)
+    \\float GeometrySchlickGGX(float NdotV, float roughness) {
+    \\    float r = roughness + 1.0;
+    \\    float k = (r * r) / 8.0;
+    \\    return NdotV / (NdotV * (1.0 - k) + k);
+    \\}
+    \\
+    \\// Smith's geometry function
+    \\float GeometrySmith(vec3 N, vec3 V, vec3 L, float roughness) {
+    \\    float NdotV = max(dot(N, V), 0.0);
+    \\    float NdotL = max(dot(N, L), 0.0);
+    \\    return GeometrySchlickGGX(NdotV, roughness) * GeometrySchlickGGX(NdotL, roughness);
+    \\}
+    \\
+    \\// Fresnel-Schlick approximation
+    \\vec3 FresnelSchlick(float cosTheta, vec3 F0) {
+    \\    return F0 + (1.0 - F0) * pow(clamp(1.0 - cosTheta, 0.0, 1.0), 5.0);
+    \\}
+    \\
+    \\// Sample GGX distribution for importance sampling
+    \\vec3 ImportanceSampleGGX(vec2 Xi, vec3 N, float roughness) {
+    \\    float a = roughness * roughness;
+    \\    float phi = 2.0 * PI * Xi.x;
+    \\    float cosTheta = sqrt((1.0 - Xi.y) / (1.0 + (a * a - 1.0) * Xi.y));
+    \\    float sinTheta = sqrt(1.0 - cosTheta * cosTheta);
+    \\
+    \\    // Spherical to cartesian
+    \\    vec3 H = vec3(cos(phi) * sinTheta, sin(phi) * sinTheta, cosTheta);
+    \\
+    \\    // Tangent space to world space
+    \\    vec3 up = abs(N.z) < 0.999 ? vec3(0.0, 0.0, 1.0) : vec3(1.0, 0.0, 0.0);
+    \\    vec3 tangent = normalize(cross(up, N));
+    \\    vec3 bitangent = cross(N, tangent);
+    \\
+    \\    return normalize(tangent * H.x + bitangent * H.y + N * H.z);
     \\}
     \\
     \\// Beautiful HDR sky with sun
@@ -485,6 +643,53 @@ const compute_shader_source: [*:0]const u8 =
     \\    return sky * 1.2;
     \\}
     \\
+    \\// ========== Next Event Estimation (Direct Light Sampling) ==========
+    \\vec3 sampleLights(vec3 point, vec3 normal, vec3 albedo) {
+    \\    vec3 direct = vec3(0.0);
+    \\
+    \\    // Sample all emissive spheres
+    \\    for (int i = 0; i < num_spheres; i++) {
+    \\        Sphere light = spheres[i];
+    \\        if (light.mat_type != 3) continue;  // Not emissive
+    \\
+    \\        // Vector to light center
+    \\        vec3 toLight = light.center - point;
+    \\        float dist2 = dot(toLight, toLight);
+    \\        float dist = sqrt(dist2);
+    \\        vec3 lightDir = toLight / dist;
+    \\
+    \\        // Check if light is in front of surface
+    \\        float cosTheta = dot(normal, lightDir);
+    \\        if (cosTheta <= 0.0) continue;
+    \\
+    \\        // Sample random point on light sphere
+    \\        vec3 randomOffset = random_unit_vector() * light.radius * 0.5;
+    \\        vec3 lightPoint = light.center + randomOffset;
+    \\        vec3 toSample = lightPoint - point;
+    \\        float sampleDist = length(toSample);
+    \\        vec3 sampleDir = toSample / sampleDist;
+    \\
+    \\        // Shadow ray - check occlusion
+    \\        HitRecord shadowRec;
+    \\        if (hit_world_bvh(point + normal * 0.002, sampleDir, 0.001, sampleDist - 0.01, shadowRec)) {
+    \\            // Check if we hit the light itself
+    \\            if (shadowRec.sphere_idx != i) continue;  // Occluded by something else
+    \\        }
+    \\
+    \\        // Solid angle of sphere light
+    \\        float sinThetaMax = light.radius / dist;
+    \\        float cosThetaMax = sqrt(max(0.0, 1.0 - sinThetaMax * sinThetaMax));
+    \\        float solidAngle = 2.0 * PI * (1.0 - cosThetaMax);
+    \\
+    \\        // Lambert BRDF contribution
+    \\        float cosThetaSample = max(0.0, dot(normal, sampleDir));
+    \\        vec3 lightContrib = albedo * light.albedo * light.emissive;
+    \\        direct += lightContrib * cosThetaSample * solidAngle / PI;
+    \\    }
+    \\
+    \\    return direct;
+    \\}
+    \\
     \\vec3 trace(vec3 ro, vec3 rd) {
     \\    vec3 color = vec3(1.0);
     \\    vec3 light = vec3(0.0);
@@ -492,11 +697,32 @@ const compute_shader_source: [*:0]const u8 =
     \\    for (int depth = 0; depth < MAX_DEPTH; depth++) {
     \\        HitRecord rec;
     \\        if (hit_world_bvh(ro, rd, 0.001, 1e30, rec)) {
-    \\            Sphere s = spheres[rec.sphere_idx];
+    \\            // Get material properties from either triangle or sphere
+    \\            int mat_type;
+    \\            vec3 albedo;
+    \\            float fuzz_or_roughness;
+    \\            float ior;
+    \\            float emissive;
+    \\
+    \\            if (rec.is_triangle) {
+    \\                Triangle tri = triangles[rec.sphere_idx];
+    \\                mat_type = tri.mat_type;
+    \\                albedo = tri.albedo;
+    \\                fuzz_or_roughness = 0.1;  // Default roughness for triangles
+    \\                ior = 1.5;
+    \\                emissive = tri.emissive;
+    \\            } else {
+    \\                Sphere s = spheres[rec.sphere_idx];
+    \\                mat_type = s.mat_type;
+    \\                albedo = s.albedo;
+    \\                fuzz_or_roughness = s.fuzz;
+    \\                ior = s.ior;
+    \\                emissive = s.emissive;
+    \\            }
     \\
     \\            // Emissive materials (lights)
-    \\            if (s.mat_type == 3) {
-    \\                light += color * s.albedo * s.emissive;
+    \\            if (mat_type == 3) {
+    \\                light += color * albedo * emissive;
     \\                break;
     \\            }
     \\
@@ -507,29 +733,52 @@ const compute_shader_source: [*:0]const u8 =
     \\                color /= p;
     \\            }
     \\
-    \\            // Lambertian diffuse
-    \\            if (s.mat_type == 0) {
+    \\            // Lambertian diffuse with NEE
+    \\            if (mat_type == 0) {
+    \\                // Direct light sampling (NEE) for faster convergence
+    \\                if (u_nee > 0.5) {
+    \\                    light += color * sampleLights(rec.point, rec.normal, albedo);
+    \\                }
+    \\
     \\                vec3 scatter_dir = rec.normal + random_unit_vector();
     \\                if (length(scatter_dir) < 0.0001) scatter_dir = rec.normal;
     \\                rd = normalize(scatter_dir);
     \\                ro = rec.point + rec.normal * 0.001;
-    \\                color *= s.albedo;
+    \\                color *= albedo;
     \\            }
-    \\            // Metal with microfacet roughness
-    \\            else if (s.mat_type == 1) {
-    \\                vec3 reflected = reflect(rd, rec.normal);
-    \\                rd = normalize(reflected + s.fuzz * random_in_unit_sphere());
-    \\                if (dot(rd, rec.normal) <= 0.0) break;
+    \\            // Metal with GGX microfacet BRDF
+    \\            else if (mat_type == 1) {
+    \\                vec3 V = -rd;
+    \\                vec3 N = rec.normal;
+    \\                float roughness = max(fuzz_or_roughness * u_roughness_mult, 0.04);
+    \\
+    \\                // GGX importance sampling for reflection direction
+    \\                vec2 Xi = vec2(rand(), rand());
+    \\                vec3 H = ImportanceSampleGGX(Xi, N, roughness);
+    \\                vec3 L = reflect(-V, H);
+    \\
+    \\                float NdotL = dot(N, L);
+    \\                if (NdotL <= 0.0) break;
+    \\
+    \\                float NdotV = max(dot(N, V), 0.0);
+    \\                float NdotH = max(dot(N, H), 0.0);
+    \\                float VdotH = max(dot(V, H), 0.0);
+    \\
+    \\                // Cook-Torrance BRDF
+    \\                vec3 F0 = albedo;  // Metal uses albedo as F0
+    \\                vec3 F = FresnelSchlick(VdotH, F0);
+    \\                float G = GeometrySmith(N, V, L, roughness);
+    \\
+    \\                // Importance sampling weight
+    \\                vec3 weight = F * G * VdotH / max(NdotH * NdotV, 0.001);
+    \\
+    \\                rd = L;
     \\                ro = rec.point + rec.normal * 0.001;
-    \\                // Fresnel for metals
-    \\                float cosTheta = abs(dot(-normalize(rd), rec.normal));
-    \\                vec3 F0 = s.albedo;
-    \\                vec3 fresnel = F0 + (1.0 - F0) * pow(1.0 - cosTheta, 5.0);
-    \\                color *= fresnel;
+    \\                color *= weight;
     \\            }
     \\            // Dielectric (glass)
-    \\            else if (s.mat_type == 2) {
-    \\                float ri = rec.front_face ? (1.0 / s.ior) : s.ior;
+    \\            else if (mat_type == 2) {
+    \\                float ri = rec.front_face ? (1.0 / ior) : ior;
     \\                vec3 unit_dir = normalize(rd);
     \\                float cos_theta = min(dot(-unit_dir, rec.normal), 1.0);
     \\                float sin_theta = sqrt(1.0 - cos_theta * cos_theta);
@@ -594,10 +843,69 @@ const compute_shader_source: [*:0]const u8 =
     \\    // Post-processing pipeline
     \\    vec3 result = accum.rgb / accum.a;
     \\
+    \\    // Chromatic aberration - sample at offset positions for each channel
+    \\    vec2 center = vec2(u_width, u_height) * 0.5;
+    \\    vec2 pixelVec = vec2(pixel) - center;
+    \\    float dist = length(pixelVec) / length(center);
+    \\    float chromaStrength = u_chromatic * dist * dist;  // Stronger at edges
+    \\
+    \\    vec2 redOffset = pixelVec * (1.0 + chromaStrength);
+    \\    vec2 blueOffset = pixelVec * (1.0 - chromaStrength);
+    \\
+    \\    ivec2 redPixel = ivec2(center + redOffset);
+    \\    ivec2 bluePixel = ivec2(center + blueOffset);
+    \\
+    \\    // Clamp to image bounds
+    \\    redPixel = clamp(redPixel, ivec2(0), ivec2(u_width - 1, u_height - 1));
+    \\    bluePixel = clamp(bluePixel, ivec2(0), ivec2(u_width - 1, u_height - 1));
+    \\
+    \\    vec4 redAccum = imageLoad(accumImage, redPixel);
+    \\    vec4 blueAccum = imageLoad(accumImage, bluePixel);
+    \\
+    \\    result.r = redAccum.r / max(redAccum.a, 1.0);
+    \\    result.b = blueAccum.b / max(blueAccum.a, 1.0);
+    \\
+    \\    // Motion blur based on camera movement
+    \\    vec3 cameraDelta = u_camera_pos - u_prev_camera_pos;
+    \\    vec3 forwardDelta = u_camera_forward - u_prev_camera_forward;
+    \\    float motionMag = length(cameraDelta) + length(forwardDelta) * 2.0;
+    \\
+    \\    if (motionMag > 0.001) {
+    \\        // Calculate screen-space velocity from camera motion
+    \\        vec2 screenUV = (vec2(pixel) / vec2(u_width, u_height)) * 2.0 - 1.0;
+    \\        vec3 viewDir = normalize(u_camera_forward + u_camera_right * screenUV.x * u_aspect + u_camera_up * screenUV.y);
+    \\        vec3 prevViewDir = normalize(u_prev_camera_forward + u_camera_right * screenUV.x * u_aspect + u_camera_up * screenUV.y);
+    \\
+    \\        // Project to screen space velocity
+    \\        vec2 velocity = (viewDir.xy - prevViewDir.xy) * 50.0 + cameraDelta.xy * 10.0;
+    \\        velocity = clamp(velocity, vec2(-20.0), vec2(20.0));
+    \\
+    \\        // Sample along motion vector
+    \\        float blurStrength = min(motionMag * u_motion_blur, 1.0);
+    \\        if (length(velocity) > 0.5) {
+    \\            vec3 motionBlurred = result;
+    \\            float totalWeight = 1.0;
+    \\            const int BLUR_SAMPLES = 5;
+    \\            for (int i = 1; i <= BLUR_SAMPLES; i++) {
+    \\                float t = float(i) / float(BLUR_SAMPLES);
+    \\                ivec2 samplePos = pixel + ivec2(velocity * t * blurStrength);
+    \\                samplePos = clamp(samplePos, ivec2(0), ivec2(u_width - 1, u_height - 1));
+    \\                vec4 sampleAccum = imageLoad(accumImage, samplePos);
+    \\                float weight = 1.0 - t * 0.5;
+    \\                motionBlurred += (sampleAccum.rgb / max(sampleAccum.a, 1.0)) * weight;
+    \\                totalWeight += weight;
+    \\            }
+    \\            result = motionBlurred / totalWeight;
+    \\        }
+    \\    }
+    \\
     \\    // Subtle bloom approximation for bright areas
     \\    float luminance = dot(result, vec3(0.299, 0.587, 0.114));
-    \\    float bloom = max(0.0, luminance - 1.0) * 0.15;
+    \\    float bloom = max(0.0, luminance - 1.0) * u_bloom;
     \\    result += bloom * vec3(1.0, 0.9, 0.8);
+    \\
+    \\    // Exposure adjustment
+    \\    result *= u_exposure;
     \\
     \\    // ACES filmic tone mapping (cinematic look)
     \\    result = (result * (2.51 * result + 0.03)) / (result * (2.43 * result + 0.59) + 0.14);
@@ -608,9 +916,9 @@ const compute_shader_source: [*:0]const u8 =
     \\    // Gamma correction
     \\    result = pow(clamp(result, 0.0, 1.0), vec3(1.0 / 2.2));
     \\
-    \\    // Subtle vignette for cinematic look
+    \\    // Vignette for cinematic look
     \\    vec2 uv_vignette = vec2(pixel) / vec2(u_width, u_height);
-    \\    float vignette = 1.0 - 0.15 * length((uv_vignette - 0.5) * 1.2);
+    \\    float vignette = 1.0 - u_vignette * length((uv_vignette - 0.5) * 1.2);
     \\    result *= vignette;
     \\
     \\    imageStore(outputImage, pixel, vec4(result, 1.0));
@@ -629,6 +937,23 @@ const GPUSphere = extern struct {
     emissive: f32,
     mat_type: i32,
     pad: f32,
+};
+
+const GPUTriangle = extern struct {
+    v0: [3]f32,
+    mat_type: i32,
+    v1: [3]f32,
+    pad1: f32,
+    v2: [3]f32,
+    pad2: f32,
+    n0: [3]f32,
+    pad3: f32,
+    n1: [3]f32,
+    pad4: f32,
+    n2: [3]f32,
+    pad5: f32,
+    albedo: [3]f32,
+    emissive: f32,
 };
 
 const GPUBVHNode = extern struct {
@@ -897,10 +1222,88 @@ pub fn main() !void {
     glBufferData(GL_SHADER_STORAGE_BUFFER, @intCast(bvh_buffer_size), bvh_buffer_data.ptr, GL_DYNAMIC_DRAW);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 3, bvh_ssbo);
 
+    // Create demo triangle mesh (a metallic cube)
+    var triangles = std.ArrayList(GPUTriangle).init(allocator);
+    defer triangles.deinit();
+
+    // Cube vertices (centered at 0, 2, -5)
+    const cube_pos = Vec3.init(0.0, 2.0, -5.0);
+    const cube_size: f32 = 1.0;
+    const half = cube_size / 2.0;
+
+    // Cube corners
+    const v = [8]Vec3{
+        cube_pos.add(Vec3.init(-half, -half, -half)),
+        cube_pos.add(Vec3.init(half, -half, -half)),
+        cube_pos.add(Vec3.init(half, half, -half)),
+        cube_pos.add(Vec3.init(-half, half, -half)),
+        cube_pos.add(Vec3.init(-half, -half, half)),
+        cube_pos.add(Vec3.init(half, -half, half)),
+        cube_pos.add(Vec3.init(half, half, half)),
+        cube_pos.add(Vec3.init(-half, half, half)),
+    };
+
+    // Face normals
+    const normals = [6]Vec3{
+        Vec3.init(0, 0, -1), // Front
+        Vec3.init(0, 0, 1),  // Back
+        Vec3.init(0, 1, 0),  // Top
+        Vec3.init(0, -1, 0), // Bottom
+        Vec3.init(-1, 0, 0), // Left
+        Vec3.init(1, 0, 0),  // Right
+    };
+
+    // Cube faces (2 triangles each, metallic gold material)
+    const cube_albedo = [3]f32{ 1.0, 0.84, 0.0 }; // Gold color
+    const cube_mat_type: i32 = 1; // Metal
+
+    // Front face
+    try triangles.append(.{ .v0 = .{ v[0].x, v[0].y, v[0].z }, .v1 = .{ v[1].x, v[1].y, v[1].z }, .v2 = .{ v[2].x, v[2].y, v[2].z }, .n0 = .{ normals[0].x, normals[0].y, normals[0].z }, .n1 = .{ normals[0].x, normals[0].y, normals[0].z }, .n2 = .{ normals[0].x, normals[0].y, normals[0].z }, .albedo = cube_albedo, .mat_type = cube_mat_type, .emissive = 0.0, .pad1 = 0, .pad2 = 0, .pad3 = 0, .pad4 = 0, .pad5 = 0 });
+    try triangles.append(.{ .v0 = .{ v[0].x, v[0].y, v[0].z }, .v1 = .{ v[2].x, v[2].y, v[2].z }, .v2 = .{ v[3].x, v[3].y, v[3].z }, .n0 = .{ normals[0].x, normals[0].y, normals[0].z }, .n1 = .{ normals[0].x, normals[0].y, normals[0].z }, .n2 = .{ normals[0].x, normals[0].y, normals[0].z }, .albedo = cube_albedo, .mat_type = cube_mat_type, .emissive = 0.0, .pad1 = 0, .pad2 = 0, .pad3 = 0, .pad4 = 0, .pad5 = 0 });
+
+    // Back face
+    try triangles.append(.{ .v0 = .{ v[5].x, v[5].y, v[5].z }, .v1 = .{ v[4].x, v[4].y, v[4].z }, .v2 = .{ v[7].x, v[7].y, v[7].z }, .n0 = .{ normals[1].x, normals[1].y, normals[1].z }, .n1 = .{ normals[1].x, normals[1].y, normals[1].z }, .n2 = .{ normals[1].x, normals[1].y, normals[1].z }, .albedo = cube_albedo, .mat_type = cube_mat_type, .emissive = 0.0, .pad1 = 0, .pad2 = 0, .pad3 = 0, .pad4 = 0, .pad5 = 0 });
+    try triangles.append(.{ .v0 = .{ v[5].x, v[5].y, v[5].z }, .v1 = .{ v[7].x, v[7].y, v[7].z }, .v2 = .{ v[6].x, v[6].y, v[6].z }, .n0 = .{ normals[1].x, normals[1].y, normals[1].z }, .n1 = .{ normals[1].x, normals[1].y, normals[1].z }, .n2 = .{ normals[1].x, normals[1].y, normals[1].z }, .albedo = cube_albedo, .mat_type = cube_mat_type, .emissive = 0.0, .pad1 = 0, .pad2 = 0, .pad3 = 0, .pad4 = 0, .pad5 = 0 });
+
+    // Top face
+    try triangles.append(.{ .v0 = .{ v[3].x, v[3].y, v[3].z }, .v1 = .{ v[2].x, v[2].y, v[2].z }, .v2 = .{ v[6].x, v[6].y, v[6].z }, .n0 = .{ normals[2].x, normals[2].y, normals[2].z }, .n1 = .{ normals[2].x, normals[2].y, normals[2].z }, .n2 = .{ normals[2].x, normals[2].y, normals[2].z }, .albedo = cube_albedo, .mat_type = cube_mat_type, .emissive = 0.0, .pad1 = 0, .pad2 = 0, .pad3 = 0, .pad4 = 0, .pad5 = 0 });
+    try triangles.append(.{ .v0 = .{ v[3].x, v[3].y, v[3].z }, .v1 = .{ v[6].x, v[6].y, v[6].z }, .v2 = .{ v[7].x, v[7].y, v[7].z }, .n0 = .{ normals[2].x, normals[2].y, normals[2].z }, .n1 = .{ normals[2].x, normals[2].y, normals[2].z }, .n2 = .{ normals[2].x, normals[2].y, normals[2].z }, .albedo = cube_albedo, .mat_type = cube_mat_type, .emissive = 0.0, .pad1 = 0, .pad2 = 0, .pad3 = 0, .pad4 = 0, .pad5 = 0 });
+
+    // Bottom face
+    try triangles.append(.{ .v0 = .{ v[4].x, v[4].y, v[4].z }, .v1 = .{ v[5].x, v[5].y, v[5].z }, .v2 = .{ v[1].x, v[1].y, v[1].z }, .n0 = .{ normals[3].x, normals[3].y, normals[3].z }, .n1 = .{ normals[3].x, normals[3].y, normals[3].z }, .n2 = .{ normals[3].x, normals[3].y, normals[3].z }, .albedo = cube_albedo, .mat_type = cube_mat_type, .emissive = 0.0, .pad1 = 0, .pad2 = 0, .pad3 = 0, .pad4 = 0, .pad5 = 0 });
+    try triangles.append(.{ .v0 = .{ v[4].x, v[4].y, v[4].z }, .v1 = .{ v[1].x, v[1].y, v[1].z }, .v2 = .{ v[0].x, v[0].y, v[0].z }, .n0 = .{ normals[3].x, normals[3].y, normals[3].z }, .n1 = .{ normals[3].x, normals[3].y, normals[3].z }, .n2 = .{ normals[3].x, normals[3].y, normals[3].z }, .albedo = cube_albedo, .mat_type = cube_mat_type, .emissive = 0.0, .pad1 = 0, .pad2 = 0, .pad3 = 0, .pad4 = 0, .pad5 = 0 });
+
+    // Left face
+    try triangles.append(.{ .v0 = .{ v[4].x, v[4].y, v[4].z }, .v1 = .{ v[0].x, v[0].y, v[0].z }, .v2 = .{ v[3].x, v[3].y, v[3].z }, .n0 = .{ normals[4].x, normals[4].y, normals[4].z }, .n1 = .{ normals[4].x, normals[4].y, normals[4].z }, .n2 = .{ normals[4].x, normals[4].y, normals[4].z }, .albedo = cube_albedo, .mat_type = cube_mat_type, .emissive = 0.0, .pad1 = 0, .pad2 = 0, .pad3 = 0, .pad4 = 0, .pad5 = 0 });
+    try triangles.append(.{ .v0 = .{ v[4].x, v[4].y, v[4].z }, .v1 = .{ v[3].x, v[3].y, v[3].z }, .v2 = .{ v[7].x, v[7].y, v[7].z }, .n0 = .{ normals[4].x, normals[4].y, normals[4].z }, .n1 = .{ normals[4].x, normals[4].y, normals[4].z }, .n2 = .{ normals[4].x, normals[4].y, normals[4].z }, .albedo = cube_albedo, .mat_type = cube_mat_type, .emissive = 0.0, .pad1 = 0, .pad2 = 0, .pad3 = 0, .pad4 = 0, .pad5 = 0 });
+
+    // Right face
+    try triangles.append(.{ .v0 = .{ v[1].x, v[1].y, v[1].z }, .v1 = .{ v[5].x, v[5].y, v[5].z }, .v2 = .{ v[6].x, v[6].y, v[6].z }, .n0 = .{ normals[5].x, normals[5].y, normals[5].z }, .n1 = .{ normals[5].x, normals[5].y, normals[5].z }, .n2 = .{ normals[5].x, normals[5].y, normals[5].z }, .albedo = cube_albedo, .mat_type = cube_mat_type, .emissive = 0.0, .pad1 = 0, .pad2 = 0, .pad3 = 0, .pad4 = 0, .pad5 = 0 });
+    try triangles.append(.{ .v0 = .{ v[1].x, v[1].y, v[1].z }, .v1 = .{ v[6].x, v[6].y, v[6].z }, .v2 = .{ v[2].x, v[2].y, v[2].z }, .n0 = .{ normals[5].x, normals[5].y, normals[5].z }, .n1 = .{ normals[5].x, normals[5].y, normals[5].z }, .n2 = .{ normals[5].x, normals[5].y, normals[5].z }, .albedo = cube_albedo, .mat_type = cube_mat_type, .emissive = 0.0, .pad1 = 0, .pad2 = 0, .pad3 = 0, .pad4 = 0, .pad5 = 0 });
+
+    std.debug.print("Scene: {} triangles\n", .{triangles.items.len});
+
+    // Upload triangle buffer
+    var triangle_ssbo: GLuint = 0;
+    glGenBuffers(1, &triangle_ssbo);
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, triangle_ssbo);
+    const tri_header_size = 16;
+    const tri_buffer_size = tri_header_size + triangles.items.len * @sizeOf(GPUTriangle);
+    const tri_buffer_data = try allocator.alloc(u8, tri_buffer_size);
+    defer allocator.free(tri_buffer_data);
+    const num_triangles: i32 = @intCast(triangles.items.len);
+    @memcpy(tri_buffer_data[0..4], std.mem.asBytes(&num_triangles));
+    @memset(tri_buffer_data[4..16], 0);
+    @memcpy(tri_buffer_data[tri_header_size..], std.mem.sliceAsBytes(triangles.items));
+    glBufferData(GL_SHADER_STORAGE_BUFFER, @intCast(tri_buffer_size), tri_buffer_data.ptr, GL_DYNAMIC_DRAW);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 4, triangle_ssbo);
+
     const u_camera_pos_loc = glGetUniformLocation(compute_program, "u_camera_pos");
     const u_camera_forward_loc = glGetUniformLocation(compute_program, "u_camera_forward");
     const u_camera_right_loc = glGetUniformLocation(compute_program, "u_camera_right");
     const u_camera_up_loc = glGetUniformLocation(compute_program, "u_camera_up");
+    const u_prev_camera_pos_loc = glGetUniformLocation(compute_program, "u_prev_camera_pos");
+    const u_prev_camera_forward_loc = glGetUniformLocation(compute_program, "u_prev_camera_forward");
     const u_fov_scale_loc = glGetUniformLocation(compute_program, "u_fov_scale");
     const u_aperture_loc = glGetUniformLocation(compute_program, "u_aperture");
     const u_focus_dist_loc = glGetUniformLocation(compute_program, "u_focus_dist");
@@ -910,7 +1313,20 @@ pub fn main() !void {
     const u_height_loc = glGetUniformLocation(compute_program, "u_height");
     const u_aspect_loc = glGetUniformLocation(compute_program, "u_aspect");
 
+    // Effect control uniforms
+    const u_chromatic_loc = glGetUniformLocation(compute_program, "u_chromatic");
+    const u_motion_blur_loc = glGetUniformLocation(compute_program, "u_motion_blur");
+    const u_bloom_loc = glGetUniformLocation(compute_program, "u_bloom");
+    const u_nee_loc = glGetUniformLocation(compute_program, "u_nee");
+    const u_roughness_mult_loc = glGetUniformLocation(compute_program, "u_roughness_mult");
+    const u_exposure_loc = glGetUniformLocation(compute_program, "u_exposure");
+    const u_vignette_loc = glGetUniformLocation(compute_program, "u_vignette");
+
     g_camera_yaw = std.math.atan2(@as(f32, -3.0), @as(f32, -13.0));
+
+    // Previous camera state for motion blur
+    var prev_camera_pos = g_camera_pos;
+    var prev_forward = Vec3.init(0, 0, -1);
 
     var frame_count: u32 = 0;
     var total_frames: u32 = 0;
@@ -935,7 +1351,8 @@ pub fn main() !void {
             current_fps = @as(f32, @floatFromInt(frame_count)) * 1000.0 / @as(f32, @floatFromInt(current_time - fps_timer));
             frame_count = 0;
             fps_timer = current_time;
-            const title = std.fmt.bufPrintZ(&title_buf, "Zig Raytracer | FPS:{d:.0} | FOV:{d:.0} | DOF:{d:.2} | SPF:{} | [H]elp [F12]Screenshot", .{ current_fps, g_fov, g_aperture, g_samples_per_frame }) catch "Zig Raytracer";
+            const nee_str: []const u8 = if (g_nee_enabled) "ON" else "OFF";
+            const title = std.fmt.bufPrintZ(&title_buf, "Raytracer | FPS:{d:.0} SPF:{} | C:{d:.3} M:{d:.1} B:{d:.2} E:{d:.1} V:{d:.2} R:{d:.1} NEE:{s}", .{ current_fps, g_samples_per_frame, g_chromatic_strength, g_motion_blur_strength, g_bloom_strength, g_exposure, g_vignette_strength, g_roughness_mult, nee_str }) catch "Raytracer";
             _ = win32.SetWindowTextA(hwnd, title.ptr);
         }
 
@@ -1001,6 +1418,67 @@ pub fn main() !void {
         if (g_keys['3']) { g_samples_per_frame = 8; g_keys['3'] = false; }
         if (g_keys['4']) { g_samples_per_frame = 16; g_keys['4'] = false; }
 
+        // ============ EFFECT CONTROLS ============
+        // C - Chromatic aberration (hold Shift for decrease)
+        if (g_keys['C']) {
+            if (g_keys[0x10]) { // Shift
+                g_chromatic_strength = @max(0.0, g_chromatic_strength - 0.001);
+            } else {
+                g_chromatic_strength = @min(0.02, g_chromatic_strength + 0.001);
+            }
+            camera_moved = true; g_keys['C'] = false;
+        }
+        // M - Motion blur (hold Shift for decrease)
+        if (g_keys['M']) {
+            if (g_keys[0x10]) {
+                g_motion_blur_strength = @max(0.0, g_motion_blur_strength - 0.1);
+            } else {
+                g_motion_blur_strength = @min(2.0, g_motion_blur_strength + 0.1);
+            }
+            camera_moved = true; g_keys['M'] = false;
+        }
+        // B - Bloom (hold Shift for decrease)
+        if (g_keys['B']) {
+            if (g_keys[0x10]) {
+                g_bloom_strength = @max(0.0, g_bloom_strength - 0.05);
+            } else {
+                g_bloom_strength = @min(1.0, g_bloom_strength + 0.05);
+            }
+            camera_moved = true; g_keys['B'] = false;
+        }
+        // N - Toggle NEE (Next Event Estimation)
+        if (g_keys['N']) {
+            g_nee_enabled = !g_nee_enabled;
+            camera_moved = true; g_keys['N'] = false;
+        }
+        // R - Roughness multiplier (hold Shift for decrease)
+        if (g_keys['R']) {
+            if (g_keys[0x10]) {
+                g_roughness_mult = @max(0.1, g_roughness_mult - 0.1);
+            } else {
+                g_roughness_mult = @min(3.0, g_roughness_mult + 0.1);
+            }
+            camera_moved = true; g_keys['R'] = false;
+        }
+        // E - Exposure (hold Shift for decrease)
+        if (g_keys['E']) {
+            if (g_keys[0x10]) {
+                g_exposure = @max(0.1, g_exposure - 0.1);
+            } else {
+                g_exposure = @min(5.0, g_exposure + 0.1);
+            }
+            camera_moved = true; g_keys['E'] = false;
+        }
+        // V - Vignette (hold Shift for decrease)
+        if (g_keys['V']) {
+            if (g_keys[0x10]) {
+                g_vignette_strength = @max(0.0, g_vignette_strength - 0.05);
+            } else {
+                g_vignette_strength = @min(0.5, g_vignette_strength + 0.05);
+            }
+            camera_moved = true; g_keys['V'] = false;
+        }
+
         // Reset accumulation when camera moves
         if (camera_moved) {
             total_frames = 0;
@@ -1015,6 +1493,8 @@ pub fn main() !void {
         glUniform3f(u_camera_forward_loc, forward.x, forward.y, forward.z);
         glUniform3f(u_camera_right_loc, right.x, right.y, right.z);
         glUniform3f(u_camera_up_loc, up.x, up.y, up.z);
+        glUniform3f(u_prev_camera_pos_loc, prev_camera_pos.x, prev_camera_pos.y, prev_camera_pos.z);
+        glUniform3f(u_prev_camera_forward_loc, prev_forward.x, prev_forward.y, prev_forward.z);
         glUniform1f(u_fov_scale_loc, 1.0 / @tan(g_fov * std.math.pi / 180.0 / 2.0));
         glUniform1f(u_aperture_loc, g_aperture);
         glUniform1f(u_focus_dist_loc, g_focus_dist);
@@ -1022,6 +1502,15 @@ pub fn main() !void {
         glUniform1i(u_height_loc, @intCast(RENDER_HEIGHT));
         glUniform1f(u_aspect_loc, @as(f32, @floatFromInt(RENDER_WIDTH)) / @as(f32, @floatFromInt(RENDER_HEIGHT)));
         glUniform1ui(u_frame_loc, total_frames);
+
+        // Effect controls
+        glUniform1f(u_chromatic_loc, g_chromatic_strength);
+        glUniform1f(u_motion_blur_loc, g_motion_blur_strength);
+        glUniform1f(u_bloom_loc, g_bloom_strength);
+        glUniform1f(u_nee_loc, if (g_nee_enabled) 1.0 else 0.0);
+        glUniform1f(u_roughness_mult_loc, g_roughness_mult);
+        glUniform1f(u_exposure_loc, g_exposure);
+        glUniform1f(u_vignette_loc, g_vignette_strength);
 
         const groups_x = (RENDER_WIDTH + 15) / 16;
         const groups_y = (RENDER_HEIGHT + 15) / 16;
@@ -1043,6 +1532,10 @@ pub fn main() !void {
         gl.glEnd();
 
         _ = win32.SwapBuffers(hdc);
+
+        // Update previous camera state for next frame's motion blur
+        prev_camera_pos = g_camera_pos;
+        prev_forward = forward;
 
         // Save screenshot if requested
         if (g_save_screenshot) {
