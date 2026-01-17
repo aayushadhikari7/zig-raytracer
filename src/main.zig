@@ -393,6 +393,12 @@ const compute_shader_source: [*:0]const u8 =
     \\    Triangle triangles[];
     \\};
     \\
+    \\layout(std430, binding = 5) buffer TriBVHBuffer {
+    \\    int num_tri_nodes;
+    \\    int tri_bvh_pad1, tri_bvh_pad2, tri_bvh_pad3;
+    \\    BVHNode tri_nodes[];
+    \\};
+    \\
     \\uint state;
     \\
     \\uint pcg_hash(uint input) {
@@ -964,6 +970,235 @@ const GPUBVHNode = extern struct {
 };
 
 // ============================================================================
+// OBJ FILE LOADER
+// ============================================================================
+const ObjMesh = struct {
+    triangles: std.ArrayList(GPUTriangle),
+
+    fn deinit(self: *ObjMesh) void {
+        self.triangles.deinit();
+    }
+};
+
+fn loadObj(allocator: std.mem.Allocator, path: []const u8, transform: struct {
+    scale: f32 = 1.0,
+    offset: Vec3 = Vec3.init(0, 0, 0),
+    albedo: [3]f32 = .{ 0.8, 0.8, 0.8 },
+    mat_type: i32 = 0,
+    emissive: f32 = 0.0,
+}) !ObjMesh {
+    var mesh = ObjMesh{
+        .triangles = std.ArrayList(GPUTriangle).init(allocator),
+    };
+    errdefer mesh.deinit();
+
+    // Read file
+    const file = std.fs.cwd().openFile(path, .{}) catch |err| {
+        std.debug.print("Failed to open OBJ file '{s}': {}\n", .{ path, err });
+        return err;
+    };
+    defer file.close();
+
+    const content = file.readToEndAlloc(allocator, 50 * 1024 * 1024) catch |err| {
+        std.debug.print("Failed to read OBJ file: {}\n", .{err});
+        return err;
+    };
+    defer allocator.free(content);
+
+    // Parse vertices and normals
+    var vertices = std.ArrayList(Vec3).init(allocator);
+    defer vertices.deinit();
+    var normals = std.ArrayList(Vec3).init(allocator);
+    defer normals.deinit();
+
+    var lines = std.mem.splitScalar(u8, content, '\n');
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+        if (trimmed.len == 0 or trimmed[0] == '#') continue;
+
+        var parts = std.mem.splitScalar(u8, trimmed, ' ');
+        const cmd = parts.next() orelse continue;
+
+        if (std.mem.eql(u8, cmd, "v")) {
+            // Vertex position
+            const x = std.fmt.parseFloat(f32, parts.next() orelse continue) catch continue;
+            const y = std.fmt.parseFloat(f32, parts.next() orelse continue) catch continue;
+            const z = std.fmt.parseFloat(f32, parts.next() orelse continue) catch continue;
+            try vertices.append(Vec3.init(
+                x * transform.scale + transform.offset.x,
+                y * transform.scale + transform.offset.y,
+                z * transform.scale + transform.offset.z,
+            ));
+        } else if (std.mem.eql(u8, cmd, "vn")) {
+            // Vertex normal
+            const x = std.fmt.parseFloat(f32, parts.next() orelse continue) catch continue;
+            const y = std.fmt.parseFloat(f32, parts.next() orelse continue) catch continue;
+            const z = std.fmt.parseFloat(f32, parts.next() orelse continue) catch continue;
+            try normals.append(Vec3.init(x, y, z).normalize());
+        } else if (std.mem.eql(u8, cmd, "f")) {
+            // Face - collect all vertex indices
+            var face_verts: [16]usize = undefined;
+            var face_norms: [16]?usize = undefined;
+            var face_count: usize = 0;
+
+            while (parts.next()) |face_part| {
+                if (face_part.len == 0) continue;
+                if (face_count >= 16) break;
+
+                // Parse v/vt/vn or v//vn or v
+                var indices = std.mem.splitScalar(u8, face_part, '/');
+                const v_str = indices.next() orelse continue;
+                const v_idx = (std.fmt.parseInt(usize, v_str, 10) catch continue);
+                if (v_idx == 0 or v_idx > vertices.items.len) continue;
+                face_verts[face_count] = v_idx - 1;
+
+                // Skip texture coord
+                _ = indices.next();
+
+                // Normal index (optional)
+                if (indices.next()) |n_str| {
+                    if (n_str.len > 0) {
+                        const n_idx = std.fmt.parseInt(usize, n_str, 10) catch 0;
+                        if (n_idx > 0 and n_idx <= normals.items.len) {
+                            face_norms[face_count] = n_idx - 1;
+                        } else {
+                            face_norms[face_count] = null;
+                        }
+                    } else {
+                        face_norms[face_count] = null;
+                    }
+                } else {
+                    face_norms[face_count] = null;
+                }
+
+                face_count += 1;
+            }
+
+            // Triangulate face (fan triangulation)
+            if (face_count >= 3) {
+                var i: usize = 1;
+                while (i < face_count - 1) : (i += 1) {
+                    const v0 = vertices.items[face_verts[0]];
+                    const v1 = vertices.items[face_verts[i]];
+                    const v2 = vertices.items[face_verts[i + 1]];
+
+                    // Calculate face normal if not provided
+                    const edge1 = v1.sub(v0);
+                    const edge2 = v2.sub(v0);
+                    const face_normal = edge1.cross(edge2).normalize();
+
+                    const n0 = if (face_norms[0]) |ni| normals.items[ni] else face_normal;
+                    const n1 = if (face_norms[i]) |ni| normals.items[ni] else face_normal;
+                    const n2 = if (face_norms[i + 1]) |ni| normals.items[ni] else face_normal;
+
+                    try mesh.triangles.append(.{
+                        .v0 = .{ v0.x, v0.y, v0.z },
+                        .v1 = .{ v1.x, v1.y, v1.z },
+                        .v2 = .{ v2.x, v2.y, v2.z },
+                        .n0 = .{ n0.x, n0.y, n0.z },
+                        .n1 = .{ n1.x, n1.y, n1.z },
+                        .n2 = .{ n2.x, n2.y, n2.z },
+                        .albedo = transform.albedo,
+                        .mat_type = transform.mat_type,
+                        .emissive = transform.emissive,
+                        .pad1 = 0,
+                        .pad2 = 0,
+                        .pad3 = 0,
+                        .pad4 = 0,
+                        .pad5 = 0,
+                    });
+                }
+            }
+        }
+    }
+
+    std.debug.print("Loaded OBJ '{s}': {} vertices, {} normals, {} triangles\n", .{ path, vertices.items.len, normals.items.len, mesh.triangles.items.len });
+    return mesh;
+}
+
+fn createIcosphere(triangles: *std.ArrayList(GPUTriangle), center: Vec3, radius: f32, subdivisions: u32, material: struct {
+    albedo: [3]f32,
+    mat_type: i32,
+    emissive: f32,
+}) !void {
+    // Golden ratio for icosahedron
+    const phi: f32 = (1.0 + @sqrt(5.0)) / 2.0;
+    const a: f32 = 1.0;
+    const b: f32 = 1.0 / phi;
+
+    // Icosahedron vertices (normalized)
+    const base_verts = [12]Vec3{
+        Vec3.init(0, b, -a).normalize(),
+        Vec3.init(b, a, 0).normalize(),
+        Vec3.init(-b, a, 0).normalize(),
+        Vec3.init(0, b, a).normalize(),
+        Vec3.init(0, -b, a).normalize(),
+        Vec3.init(-a, 0, b).normalize(),
+        Vec3.init(0, -b, -a).normalize(),
+        Vec3.init(a, 0, -b).normalize(),
+        Vec3.init(a, 0, b).normalize(),
+        Vec3.init(-a, 0, -b).normalize(),
+        Vec3.init(b, -a, 0).normalize(),
+        Vec3.init(-b, -a, 0).normalize(),
+    };
+
+    // Icosahedron faces (20 triangles)
+    const faces = [20][3]u8{
+        .{ 2, 1, 0 },  .{ 1, 2, 3 },  .{ 5, 4, 3 },  .{ 4, 8, 3 },
+        .{ 7, 6, 0 },  .{ 6, 9, 0 },  .{ 11, 10, 4 }, .{ 10, 11, 6 },
+        .{ 9, 5, 2 },  .{ 5, 9, 11 }, .{ 8, 7, 1 },  .{ 7, 8, 10 },
+        .{ 2, 5, 3 },  .{ 8, 1, 3 },  .{ 9, 2, 0 },  .{ 1, 7, 0 },
+        .{ 11, 9, 6 }, .{ 7, 10, 6 }, .{ 5, 11, 4 }, .{ 10, 8, 4 },
+    };
+
+    // Helper to add a subdivided triangle
+    const SubdivideHelper = struct {
+        fn subdivide(tris: *std.ArrayList(GPUTriangle), v0: Vec3, v1: Vec3, v2: Vec3, depth: u32, c: Vec3, r: f32, mat: struct {
+            albedo: [3]f32,
+            mat_type: i32,
+            emissive: f32,
+        }) !void {
+            if (depth == 0) {
+                // Add final triangle
+                const p0 = c.add(v0.scale(r));
+                const p1 = c.add(v1.scale(r));
+                const p2 = c.add(v2.scale(r));
+                try tris.append(.{
+                    .v0 = .{ p0.x, p0.y, p0.z },
+                    .v1 = .{ p1.x, p1.y, p1.z },
+                    .v2 = .{ p2.x, p2.y, p2.z },
+                    .n0 = .{ v0.x, v0.y, v0.z },
+                    .n1 = .{ v1.x, v1.y, v1.z },
+                    .n2 = .{ v2.x, v2.y, v2.z },
+                    .albedo = mat.albedo,
+                    .mat_type = mat.mat_type,
+                    .emissive = mat.emissive,
+                    .pad1 = 0,
+                    .pad2 = 0,
+                    .pad3 = 0,
+                    .pad4 = 0,
+                    .pad5 = 0,
+                });
+            } else {
+                // Subdivide
+                const m01 = v0.add(v1).scale(0.5).normalize();
+                const m12 = v1.add(v2).scale(0.5).normalize();
+                const m20 = v2.add(v0).scale(0.5).normalize();
+                try subdivide(tris, v0, m01, m20, depth - 1, c, r, mat);
+                try subdivide(tris, m01, v1, m12, depth - 1, c, r, mat);
+                try subdivide(tris, m20, m12, v2, depth - 1, c, r, mat);
+                try subdivide(tris, m01, m12, m20, depth - 1, c, r, mat);
+            }
+        }
+    };
+
+    // Generate all triangles
+    for (faces) |face| {
+        try SubdivideHelper.subdivide(triangles, base_verts[face[0]], base_verts[face[1]], base_verts[face[2]], subdivisions, center, radius, material);
+    }
+}
+
+// ============================================================================
 // BVH BUILDING
 // ============================================================================
 const AABB = struct {
@@ -1222,64 +1457,84 @@ pub fn main() !void {
     glBufferData(GL_SHADER_STORAGE_BUFFER, @intCast(bvh_buffer_size), bvh_buffer_data.ptr, GL_DYNAMIC_DRAW);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 3, bvh_ssbo);
 
-    // Create demo triangle mesh (a metallic cube)
+    // Load triangle meshes - try OBJ files first, fallback to procedural
     var triangles = std.ArrayList(GPUTriangle).init(allocator);
     defer triangles.deinit();
 
-    // Cube vertices (centered at 0, 2, -5)
-    const cube_pos = Vec3.init(0.0, 2.0, -5.0);
-    const cube_size: f32 = 1.0;
-    const half = cube_size / 2.0;
+    // Try loading OBJ files from models folder
+    // Model 1: Golden torus (center)
+    if (loadObj(allocator, "models/torus.obj", .{
+        .scale = 0.8,
+        .offset = Vec3.init(0.0, 1.2, -5.0),
+        .albedo = .{ 1.0, 0.84, 0.0 }, // Gold
+        .mat_type = 1, // Metal
+    })) |mesh| {
+        defer @constCast(&mesh).deinit();
+        try triangles.appendSlice(mesh.triangles.items);
+        std.debug.print("Loaded torus.obj\n", .{});
+    } else |_| {}
 
-    // Cube corners
-    const v = [8]Vec3{
-        cube_pos.add(Vec3.init(-half, -half, -half)),
-        cube_pos.add(Vec3.init(half, -half, -half)),
-        cube_pos.add(Vec3.init(half, half, -half)),
-        cube_pos.add(Vec3.init(-half, half, -half)),
-        cube_pos.add(Vec3.init(-half, -half, half)),
-        cube_pos.add(Vec3.init(half, -half, half)),
-        cube_pos.add(Vec3.init(half, half, half)),
-        cube_pos.add(Vec3.init(-half, half, half)),
-    };
+    // Model 2: Glass diamond (left)
+    if (loadObj(allocator, "models/diamond.obj", .{
+        .scale = 0.6,
+        .offset = Vec3.init(-2.5, 1.0, -4.0),
+        .albedo = .{ 0.95, 0.95, 1.0 }, // Slight blue tint
+        .mat_type = 2, // Glass
+    })) |mesh| {
+        defer @constCast(&mesh).deinit();
+        try triangles.appendSlice(mesh.triangles.items);
+        std.debug.print("Loaded diamond.obj\n", .{});
+    } else |_| {}
 
-    // Face normals
-    const normals = [6]Vec3{
-        Vec3.init(0, 0, -1), // Front
-        Vec3.init(0, 0, 1),  // Back
-        Vec3.init(0, 1, 0),  // Top
-        Vec3.init(0, -1, 0), // Bottom
-        Vec3.init(-1, 0, 0), // Left
-        Vec3.init(1, 0, 0),  // Right
-    };
+    // Model 3: Red diffuse pyramid (right)
+    if (loadObj(allocator, "models/pyramid.obj", .{
+        .scale = 0.7,
+        .offset = Vec3.init(2.5, 0.7, -4.0),
+        .albedo = .{ 0.85, 0.15, 0.1 }, // Red
+        .mat_type = 0, // Diffuse
+    })) |mesh| {
+        defer @constCast(&mesh).deinit();
+        try triangles.appendSlice(mesh.triangles.items);
+        std.debug.print("Loaded pyramid.obj\n", .{});
+    } else |_| {}
 
-    // Cube faces (2 triangles each, metallic gold material)
-    const cube_albedo = [3]f32{ 1.0, 0.84, 0.0 }; // Gold color
-    const cube_mat_type: i32 = 1; // Metal
+    // Model 4: Chrome cube (back)
+    if (loadObj(allocator, "models/cube.obj", .{
+        .scale = 1.2,
+        .offset = Vec3.init(0.0, 0.6, -8.0),
+        .albedo = .{ 0.95, 0.95, 0.97 }, // Chrome
+        .mat_type = 1, // Metal
+    })) |mesh| {
+        defer @constCast(&mesh).deinit();
+        try triangles.appendSlice(mesh.triangles.items);
+        std.debug.print("Loaded cube.obj\n", .{});
+    } else |_| {}
 
-    // Front face
-    try triangles.append(.{ .v0 = .{ v[0].x, v[0].y, v[0].z }, .v1 = .{ v[1].x, v[1].y, v[1].z }, .v2 = .{ v[2].x, v[2].y, v[2].z }, .n0 = .{ normals[0].x, normals[0].y, normals[0].z }, .n1 = .{ normals[0].x, normals[0].y, normals[0].z }, .n2 = .{ normals[0].x, normals[0].y, normals[0].z }, .albedo = cube_albedo, .mat_type = cube_mat_type, .emissive = 0.0, .pad1 = 0, .pad2 = 0, .pad3 = 0, .pad4 = 0, .pad5 = 0 });
-    try triangles.append(.{ .v0 = .{ v[0].x, v[0].y, v[0].z }, .v1 = .{ v[2].x, v[2].y, v[2].z }, .v2 = .{ v[3].x, v[3].y, v[3].z }, .n0 = .{ normals[0].x, normals[0].y, normals[0].z }, .n1 = .{ normals[0].x, normals[0].y, normals[0].z }, .n2 = .{ normals[0].x, normals[0].y, normals[0].z }, .albedo = cube_albedo, .mat_type = cube_mat_type, .emissive = 0.0, .pad1 = 0, .pad2 = 0, .pad3 = 0, .pad4 = 0, .pad5 = 0 });
+    // Fallback: if no models loaded, create procedural shapes
+    if (triangles.items.len == 0) {
+        std.debug.print("No OBJ files found, creating procedural meshes\n", .{});
 
-    // Back face
-    try triangles.append(.{ .v0 = .{ v[5].x, v[5].y, v[5].z }, .v1 = .{ v[4].x, v[4].y, v[4].z }, .v2 = .{ v[7].x, v[7].y, v[7].z }, .n0 = .{ normals[1].x, normals[1].y, normals[1].z }, .n1 = .{ normals[1].x, normals[1].y, normals[1].z }, .n2 = .{ normals[1].x, normals[1].y, normals[1].z }, .albedo = cube_albedo, .mat_type = cube_mat_type, .emissive = 0.0, .pad1 = 0, .pad2 = 0, .pad3 = 0, .pad4 = 0, .pad5 = 0 });
-    try triangles.append(.{ .v0 = .{ v[5].x, v[5].y, v[5].z }, .v1 = .{ v[7].x, v[7].y, v[7].z }, .v2 = .{ v[6].x, v[6].y, v[6].z }, .n0 = .{ normals[1].x, normals[1].y, normals[1].z }, .n1 = .{ normals[1].x, normals[1].y, normals[1].z }, .n2 = .{ normals[1].x, normals[1].y, normals[1].z }, .albedo = cube_albedo, .mat_type = cube_mat_type, .emissive = 0.0, .pad1 = 0, .pad2 = 0, .pad3 = 0, .pad4 = 0, .pad5 = 0 });
+        // Gold icosphere (center)
+        try createIcosphere(&triangles, Vec3.init(0.0, 1.5, -5.0), 1.0, 2, .{
+            .albedo = .{ 1.0, 0.84, 0.0 },
+            .mat_type = 1,
+            .emissive = 0.0,
+        });
 
-    // Top face
-    try triangles.append(.{ .v0 = .{ v[3].x, v[3].y, v[3].z }, .v1 = .{ v[2].x, v[2].y, v[2].z }, .v2 = .{ v[6].x, v[6].y, v[6].z }, .n0 = .{ normals[2].x, normals[2].y, normals[2].z }, .n1 = .{ normals[2].x, normals[2].y, normals[2].z }, .n2 = .{ normals[2].x, normals[2].y, normals[2].z }, .albedo = cube_albedo, .mat_type = cube_mat_type, .emissive = 0.0, .pad1 = 0, .pad2 = 0, .pad3 = 0, .pad4 = 0, .pad5 = 0 });
-    try triangles.append(.{ .v0 = .{ v[3].x, v[3].y, v[3].z }, .v1 = .{ v[6].x, v[6].y, v[6].z }, .v2 = .{ v[7].x, v[7].y, v[7].z }, .n0 = .{ normals[2].x, normals[2].y, normals[2].z }, .n1 = .{ normals[2].x, normals[2].y, normals[2].z }, .n2 = .{ normals[2].x, normals[2].y, normals[2].z }, .albedo = cube_albedo, .mat_type = cube_mat_type, .emissive = 0.0, .pad1 = 0, .pad2 = 0, .pad3 = 0, .pad4 = 0, .pad5 = 0 });
+        // Glass icosphere (left)
+        try createIcosphere(&triangles, Vec3.init(-2.5, 1.0, -4.0), 0.8, 2, .{
+            .albedo = .{ 1.0, 1.0, 1.0 },
+            .mat_type = 2,
+            .emissive = 0.0,
+        });
 
-    // Bottom face
-    try triangles.append(.{ .v0 = .{ v[4].x, v[4].y, v[4].z }, .v1 = .{ v[5].x, v[5].y, v[5].z }, .v2 = .{ v[1].x, v[1].y, v[1].z }, .n0 = .{ normals[3].x, normals[3].y, normals[3].z }, .n1 = .{ normals[3].x, normals[3].y, normals[3].z }, .n2 = .{ normals[3].x, normals[3].y, normals[3].z }, .albedo = cube_albedo, .mat_type = cube_mat_type, .emissive = 0.0, .pad1 = 0, .pad2 = 0, .pad3 = 0, .pad4 = 0, .pad5 = 0 });
-    try triangles.append(.{ .v0 = .{ v[4].x, v[4].y, v[4].z }, .v1 = .{ v[1].x, v[1].y, v[1].z }, .v2 = .{ v[0].x, v[0].y, v[0].z }, .n0 = .{ normals[3].x, normals[3].y, normals[3].z }, .n1 = .{ normals[3].x, normals[3].y, normals[3].z }, .n2 = .{ normals[3].x, normals[3].y, normals[3].z }, .albedo = cube_albedo, .mat_type = cube_mat_type, .emissive = 0.0, .pad1 = 0, .pad2 = 0, .pad3 = 0, .pad4 = 0, .pad5 = 0 });
-
-    // Left face
-    try triangles.append(.{ .v0 = .{ v[4].x, v[4].y, v[4].z }, .v1 = .{ v[0].x, v[0].y, v[0].z }, .v2 = .{ v[3].x, v[3].y, v[3].z }, .n0 = .{ normals[4].x, normals[4].y, normals[4].z }, .n1 = .{ normals[4].x, normals[4].y, normals[4].z }, .n2 = .{ normals[4].x, normals[4].y, normals[4].z }, .albedo = cube_albedo, .mat_type = cube_mat_type, .emissive = 0.0, .pad1 = 0, .pad2 = 0, .pad3 = 0, .pad4 = 0, .pad5 = 0 });
-    try triangles.append(.{ .v0 = .{ v[4].x, v[4].y, v[4].z }, .v1 = .{ v[3].x, v[3].y, v[3].z }, .v2 = .{ v[7].x, v[7].y, v[7].z }, .n0 = .{ normals[4].x, normals[4].y, normals[4].z }, .n1 = .{ normals[4].x, normals[4].y, normals[4].z }, .n2 = .{ normals[4].x, normals[4].y, normals[4].z }, .albedo = cube_albedo, .mat_type = cube_mat_type, .emissive = 0.0, .pad1 = 0, .pad2 = 0, .pad3 = 0, .pad4 = 0, .pad5 = 0 });
-
-    // Right face
-    try triangles.append(.{ .v0 = .{ v[1].x, v[1].y, v[1].z }, .v1 = .{ v[5].x, v[5].y, v[5].z }, .v2 = .{ v[6].x, v[6].y, v[6].z }, .n0 = .{ normals[5].x, normals[5].y, normals[5].z }, .n1 = .{ normals[5].x, normals[5].y, normals[5].z }, .n2 = .{ normals[5].x, normals[5].y, normals[5].z }, .albedo = cube_albedo, .mat_type = cube_mat_type, .emissive = 0.0, .pad1 = 0, .pad2 = 0, .pad3 = 0, .pad4 = 0, .pad5 = 0 });
-    try triangles.append(.{ .v0 = .{ v[1].x, v[1].y, v[1].z }, .v1 = .{ v[6].x, v[6].y, v[6].z }, .v2 = .{ v[2].x, v[2].y, v[2].z }, .n0 = .{ normals[5].x, normals[5].y, normals[5].z }, .n1 = .{ normals[5].x, normals[5].y, normals[5].z }, .n2 = .{ normals[5].x, normals[5].y, normals[5].z }, .albedo = cube_albedo, .mat_type = cube_mat_type, .emissive = 0.0, .pad1 = 0, .pad2 = 0, .pad3 = 0, .pad4 = 0, .pad5 = 0 });
+        // Red diffuse icosphere (right)
+        try createIcosphere(&triangles, Vec3.init(2.5, 1.0, -4.0), 0.8, 2, .{
+            .albedo = .{ 0.8, 0.2, 0.2 },
+            .mat_type = 0,
+            .emissive = 0.0,
+        });
+    }
 
     std.debug.print("Scene: {} triangles\n", .{triangles.items.len});
 
