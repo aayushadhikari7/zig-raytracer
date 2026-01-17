@@ -5,6 +5,7 @@ const bvh = @import("bvh.zig");
 const obj_loader = @import("obj_loader.zig");
 const scene = @import("scene.zig");
 const shader_module = @import("shader.zig");
+const hud = @import("hud.zig");
 
 const GPUSphere = types.GPUSphere;
 const GPUTriangle = types.GPUTriangle;
@@ -1508,6 +1509,35 @@ pub fn main() !void {
         gl.glTexCoord2f(1, 0); gl.glVertex2f(1, 1);
         gl.glTexCoord2f(0, 0); gl.glVertex2f(-1, 1);
         gl.glEnd();
+
+        // Render HUD overlay
+        hud.render(@intCast(RENDER_WIDTH), @intCast(RENDER_HEIGHT), .{
+            .fov = g_fov,
+            .aperture = g_aperture,
+            .focus_dist = g_focus_dist,
+            .samples_per_frame = g_samples_per_frame,
+            .bloom_strength = g_bloom_strength,
+            .exposure = g_exposure,
+            .chromatic_strength = g_chromatic_strength,
+            .vignette_strength = g_vignette_strength,
+            .film_grain = g_film_grain,
+            .lens_flare = g_lens_flare,
+            .dispersion = g_dispersion,
+            .heat_haze = g_heat_haze,
+            .scanlines = g_scanlines,
+            .tilt_shift = g_tilt_shift,
+            .sepia = g_sepia,
+            .dither = g_dither,
+            .night_vision = g_night_vision,
+            .thermal = g_thermal,
+            .underwater = g_underwater,
+            .fisheye = g_fisheye,
+            .kaleidoscope = g_kaleidoscope,
+            .pixelate = g_pixelate,
+            .halftone = g_halftone,
+            .vhs_effect = g_vhs_effect,
+            .anaglyph_3d = g_anaglyph_3d,
+        }, g_show_hud);
 
         _ = win32.SwapBuffers(hdc);
 
