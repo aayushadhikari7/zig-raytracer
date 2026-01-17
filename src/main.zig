@@ -1134,6 +1134,56 @@ const compute_shader_source: [*:0]const u8 =
     \\                    ro = rec.point - rec.normal * 0.001;
     \\                }
     \\            }
+    \\            // Subsurface scattering (SSS) - for skin, wax, marble, jade
+    \\            else if (mat_type == 4) {
+    \\                // SSS uses fuzz as scatter distance (mean free path)
+    \\                float scatter_dist = max(fuzz_or_roughness, 0.05);
+    \\                vec3 subsurface_color = albedo;
+    \\
+    \\                // Fresnel determines reflection vs transmission
+    \\                float cos_theta = max(dot(-rd, rec.normal), 0.0);
+    \\                float fresnel = 0.04 + 0.96 * pow(1.0 - cos_theta, 5.0);
+    \\
+    \\                if (rand() < fresnel) {
+    \\                    // Surface reflection - diffuse-like
+    \\                    vec3 scatter_dir = rec.normal + random_unit_vector();
+    \\                    if (length(scatter_dir) < 0.0001) scatter_dir = rec.normal;
+    \\                    rd = normalize(scatter_dir);
+    \\                    ro = rec.point + rec.normal * 0.001;
+    \\                    color *= albedo * 0.5;
+    \\                } else {
+    \\                    // Subsurface scattering - light enters and scatters inside
+    \\                    vec3 scatter_pos = rec.point;
+    \\                    vec3 scatter_dir = normalize(-rec.normal + random_unit_vector() * 0.8);
+    \\                    float total_dist = 0.0;
+    \\
+    \\                    // Random walk inside the material
+    \\                    const int SSS_STEPS = 4;
+    \\                    for (int i = 0; i < SSS_STEPS; i++) {
+    \\                        float step_dist = -log(max(rand(), 0.0001)) * scatter_dist;
+    \\                        scatter_pos += scatter_dir * step_dist;
+    \\                        total_dist += step_dist;
+    \\                        scatter_dir = normalize(scatter_dir + random_unit_vector());
+    \\                    }
+    \\
+    \\                    // Exit in a random direction from approximate exit point
+    \\                    vec3 exit_offset = scatter_pos - rec.point;
+    \\                    float exit_dist = length(exit_offset);
+    \\
+    \\                    // Approximate exit point on surface (project back)
+    \\                    vec3 exit_point = rec.point + normalize(exit_offset) * min(exit_dist, scatter_dist * 2.0);
+    \\                    exit_point += rec.normal * 0.001;
+    \\
+    \\                    // Attenuation based on distance traveled
+    \\                    vec3 sigma_a = vec3(1.0) / (subsurface_color + 0.001);
+    \\                    vec3 attenuation = exp(-sigma_a * total_dist * 0.5);
+    \\
+    \\                    // Exit direction - diffuse from surface
+    \\                    rd = normalize(rec.normal + random_unit_vector());
+    \\                    ro = exit_point;
+    \\                    color *= attenuation * albedo;
+    \\                }
+    \\            }
     \\        } else {
     \\            light += color * getSky(rd);
     \\            break;
@@ -2444,6 +2494,20 @@ fn setupScene(allocator: std.mem.Allocator, spheres: *std.ArrayList(GPUSphere)) 
     // Large background glass
     try spheres.append(allocator, .{ .center = .{ -5, 2, -8 }, .radius = 2.0, .albedo = .{ 1, 1, 1 }, .fuzz = 0, .ior = 1.45, .emissive = 0, .mat_type = 2, .pad = 0 });
 
+    // === SUBSURFACE SCATTERING SHOWCASE ===
+
+    // Jade sphere - green SSS
+    try spheres.append(allocator, .{ .center = .{ 2.5, 0.8, 2.5 }, .radius = 0.8, .albedo = .{ 0.3, 0.7, 0.4 }, .fuzz = 0.15, .ior = 0, .emissive = 0, .mat_type = 4, .pad = 0 });
+
+    // Wax/candle - warm SSS
+    try spheres.append(allocator, .{ .center = .{ -2.5, 0.6, 3 }, .radius = 0.6, .albedo = .{ 0.9, 0.7, 0.5 }, .fuzz = 0.2, .ior = 0, .emissive = 0, .mat_type = 4, .pad = 0 });
+
+    // Skin-like - pinkish SSS
+    try spheres.append(allocator, .{ .center = .{ 5, 0.7, -3 }, .radius = 0.7, .albedo = .{ 0.9, 0.6, 0.5 }, .fuzz = 0.1, .ior = 0, .emissive = 0, .mat_type = 4, .pad = 0 });
+
+    // Marble - white with subtle SSS
+    try spheres.append(allocator, .{ .center = .{ -6, 0.9, 3 }, .radius = 0.9, .albedo = .{ 0.95, 0.93, 0.9 }, .fuzz = 0.08, .ior = 0, .emissive = 0, .mat_type = 4, .pad = 0 });
+
     // Random spheres - now we can have more with BVH!
     var prng = std.Random.DefaultPrng.init(42);
     var rng = prng.random();
@@ -2468,8 +2532,13 @@ fn setupScene(allocator: std.mem.Allocator, spheres: *std.ArrayList(GPUSphere)) 
                 const albedo = vec3.randomVec3Range(&rng, 0.5, 1);
                 const fuzz = vec3.randomFloatRange(&rng, 0, 0.3);
                 try spheres.append(allocator, .{ .center = .{ center_x, 0.2, center_z }, .radius = 0.2, .albedo = .{ albedo.x, albedo.y, albedo.z }, .fuzz = fuzz, .ior = 0, .emissive = 0, .mat_type = 1, .pad = 0 });
-            } else if (choose_mat < 0.97) {
+            } else if (choose_mat < 0.92) {
                 try spheres.append(allocator, .{ .center = .{ center_x, 0.2, center_z }, .radius = 0.2, .albedo = .{ 1, 1, 1 }, .fuzz = 0, .ior = 1.5, .emissive = 0, .mat_type = 2, .pad = 0 });
+            } else if (choose_mat < 0.97) {
+                // SSS material - random translucent colors
+                const sss_color = vec3.randomVec3Range(&rng, 0.4, 0.95);
+                const scatter = vec3.randomFloatRange(&rng, 0.08, 0.25);
+                try spheres.append(allocator, .{ .center = .{ center_x, 0.2, center_z }, .radius = 0.2, .albedo = .{ sss_color.x, sss_color.y, sss_color.z }, .fuzz = scatter, .ior = 0, .emissive = 0, .mat_type = 4, .pad = 0 });
             } else {
                 const light_color = vec3.randomVec3Range(&rng, 0.5, 1);
                 try spheres.append(allocator, .{ .center = .{ center_x, 0.2, center_z }, .radius = 0.2, .albedo = .{ light_color.x, light_color.y, light_color.z }, .fuzz = 0, .ior = 0, .emissive = 3.0, .mat_type = 3, .pad = 0 });
