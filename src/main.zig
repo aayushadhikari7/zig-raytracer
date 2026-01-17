@@ -146,6 +146,7 @@ var g_nee_enabled: bool = true;
 var g_roughness_mult: f32 = 1.0;
 var g_exposure: f32 = 1.0;
 var g_vignette_strength: f32 = 0.15;
+var g_normal_strength: f32 = 1.5; // Normal map strength
 
 fn windowProc(hwnd: win32.HWND, msg: c_uint, wparam: win32.WPARAM, lparam: win32.LPARAM) callconv(std.builtin.CallingConvention.c) win32.LRESULT {
     switch (msg) {
@@ -336,6 +337,7 @@ const compute_shader_source: [*:0]const u8 =
     \\uniform float u_roughness_mult;
     \\uniform float u_exposure;
     \\uniform float u_vignette;
+    \\uniform float u_normal_strength;
     \\
     \\#define MAX_DEPTH 16
     \\#define BVH_STACK_SIZE 64
@@ -826,6 +828,122 @@ const compute_shader_source: [*:0]const u8 =
     \\    return base_color;
     \\}
     \\
+    \\// ============ NORMAL MAPPING ============
+    \\
+    \\// Simple hash for procedural noise
+    \\float hash(vec2 p) {
+    \\    return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453);
+    \\}
+    \\
+    \\// Smooth noise
+    \\float noise(vec2 p) {
+    \\    vec2 i = floor(p);
+    \\    vec2 f = fract(p);
+    \\    f = f * f * (3.0 - 2.0 * f);  // Smoothstep
+    \\    float a = hash(i);
+    \\    float b = hash(i + vec2(1.0, 0.0));
+    \\    float c = hash(i + vec2(0.0, 1.0));
+    \\    float d = hash(i + vec2(1.0, 1.0));
+    \\    return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
+    \\}
+    \\
+    \\// FBM noise for more detail
+    \\float fbm(vec2 p, int octaves) {
+    \\    float value = 0.0;
+    \\    float amplitude = 0.5;
+    \\    for (int i = 0; i < octaves; i++) {
+    \\        value += amplitude * noise(p);
+    \\        p *= 2.0;
+    \\        amplitude *= 0.5;
+    \\    }
+    \\    return value;
+    \\}
+    \\
+    \\// Get height value for different texture types
+    \\float getHeight(vec2 uv, int tex_id, float scale) {
+    \\    if (tex_id == 1) {
+    \\        // Checker - slight height difference at edges
+    \\        vec2 p = uv * scale * 8.0;
+    \\        vec2 f = fract(p);
+    \\        float edge = min(min(f.x, 1.0-f.x), min(f.y, 1.0-f.y));
+    \\        return smoothstep(0.0, 0.1, edge) * 0.1;
+    \\    }
+    \\    if (tex_id == 2) {
+    \\        // Brick - mortar is lower, brick surface has noise
+    \\        vec2 p = uv * 4.0;
+    \\        float row = floor(p.y);
+    \\        p.x += mod(row, 2.0) * 0.5;
+    \\        vec2 brick = fract(p);
+    \\        float mortar_width = 0.05;
+    \\        float is_mortar = step(brick.x, mortar_width) + step(1.0 - mortar_width, brick.x) +
+    \\                          step(brick.y, mortar_width) + step(1.0 - mortar_width, brick.y);
+    \\        float brick_noise = fbm(uv * 20.0, 3) * 0.1;
+    \\        return mix(0.3 + brick_noise, 0.0, clamp(is_mortar, 0.0, 1.0));
+    \\    }
+    \\    if (tex_id == 3) {
+    \\        // Marble - veins are slightly recessed
+    \\        return noise_marble(uv * 2.0) * 0.15;
+    \\    }
+    \\    if (tex_id == 4) {
+    \\        // Wood - rings create subtle bumps
+    \\        vec2 p = uv * 1.0;
+    \\        float r = length(p) * 10.0;
+    \\        float ring = sin(r + sin(p.x * 2.0) * 2.0 + sin(p.y * 1.5) * 1.5) * 0.5 + 0.5;
+    \\        return ring * ring * 0.1;
+    \\    }
+    \\    return 0.0;
+    \\}
+    \\
+    \\// Compute normal from height using finite differences
+    \\vec3 heightToNormal(vec2 uv, float scale, int tex_id) {
+    \\    float eps = 0.001;
+    \\    float h0 = getHeight(uv, tex_id, scale);
+    \\    float hx = getHeight(uv + vec2(eps, 0.0), tex_id, scale);
+    \\    float hy = getHeight(uv + vec2(0.0, eps), tex_id, scale);
+    \\    vec3 n = normalize(vec3(h0 - hx, h0 - hy, eps * 2.0));
+    \\    return n;
+    \\}
+    \\
+    \\// Build TBN matrix from normal and UV derivatives
+    \\mat3 buildTBN(vec3 N, vec3 pos, vec2 uv) {
+    \\    // Compute tangent from world position (approximate)
+    \\    vec3 Q1 = dFdx(pos);
+    \\    vec3 Q2 = dFdy(pos);
+    \\    vec2 st1 = dFdx(uv);
+    \\    vec2 st2 = dFdy(uv);
+    \\
+    \\    vec3 T = normalize(Q1 * st2.y - Q2 * st1.y);
+    \\    vec3 B = normalize(cross(N, T));
+    \\    T = cross(B, N);
+    \\
+    \\    return mat3(T, B, N);
+    \\}
+    \\
+    \\// Alternative TBN for compute shader (no dFdx/dFdy)
+    \\mat3 buildTBN_compute(vec3 N) {
+    \\    // Create arbitrary tangent perpendicular to normal
+    \\    vec3 up = abs(N.y) < 0.999 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
+    \\    vec3 T = normalize(cross(up, N));
+    \\    vec3 B = cross(N, T);
+    \\    return mat3(T, B, N);
+    \\}
+    \\
+    \\// Apply normal map perturbation
+    \\vec3 applyNormalMap(vec3 N, vec2 uv, int tex_id, float strength) {
+    \\    if (tex_id == 0) return N;  // No normal mapping
+    \\
+    \\    // Get tangent space normal from height map
+    \\    vec3 tangentNormal = heightToNormal(uv, 1.0, tex_id);
+    \\
+    \\    // Scale the perturbation
+    \\    tangentNormal.xy *= strength;
+    \\    tangentNormal = normalize(tangentNormal);
+    \\
+    \\    // Transform from tangent space to world space
+    \\    mat3 TBN = buildTBN_compute(N);
+    \\    return normalize(TBN * tangentNormal);
+    \\}
+    \\
     \\vec3 trace(vec3 ro, vec3 rd) {
     \\    vec3 color = vec3(1.0);
     \\    vec3 light = vec3(0.0);
@@ -854,6 +972,11 @@ const compute_shader_source: [*:0]const u8 =
     \\                fuzz_or_roughness = s.fuzz;
     \\                ior = s.ior;
     \\                emissive = s.emissive;
+    \\            }
+    \\
+    \\            // Apply normal mapping for textured surfaces
+    \\            if (rec.texture_id > 0 && u_normal_strength > 0.0) {
+    \\                rec.normal = applyNormalMap(rec.normal, rec.uv, rec.texture_id, u_normal_strength);
     \\            }
     \\
     \\            // Emissive materials (lights)
@@ -1887,6 +2010,7 @@ pub fn main() !void {
     const u_roughness_mult_loc = glGetUniformLocation(compute_program, "u_roughness_mult");
     const u_exposure_loc = glGetUniformLocation(compute_program, "u_exposure");
     const u_vignette_loc = glGetUniformLocation(compute_program, "u_vignette");
+    const u_normal_strength_loc = glGetUniformLocation(compute_program, "u_normal_strength");
 
     g_camera_yaw = std.math.atan2(@as(f32, -3.0), @as(f32, -13.0));
 
@@ -2044,6 +2168,15 @@ pub fn main() !void {
             }
             camera_moved = true; g_keys['V'] = false;
         }
+        // M - Normal mapping strength (hold Shift for decrease)
+        if (g_keys['M']) {
+            if (g_keys[0x10]) {
+                g_normal_strength = @max(0.0, g_normal_strength - 0.25);
+            } else {
+                g_normal_strength = @min(5.0, g_normal_strength + 0.25);
+            }
+            camera_moved = true; g_keys['M'] = false;
+        }
 
         // Reset accumulation when camera moves
         if (camera_moved) {
@@ -2077,6 +2210,7 @@ pub fn main() !void {
         glUniform1f(u_roughness_mult_loc, g_roughness_mult);
         glUniform1f(u_exposure_loc, g_exposure);
         glUniform1f(u_vignette_loc, g_vignette_strength);
+        glUniform1f(u_normal_strength_loc, g_normal_strength);
 
         const groups_x = (RENDER_WIDTH + 15) / 16;
         const groups_y = (RENDER_HEIGHT + 15) / 16;
