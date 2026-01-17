@@ -148,6 +148,8 @@ var g_exposure: f32 = 1.0;
 var g_vignette_strength: f32 = 0.15;
 var g_normal_strength: f32 = 1.5; // Normal map strength
 var g_denoise_strength: f32 = 0.5; // Denoising strength (0 = off)
+var g_fog_density: f32 = 0.0; // Volumetric fog density (0 = off)
+var g_fog_color: [3]f32 = .{ 0.8, 0.85, 0.95 }; // Fog color (blueish)
 
 fn windowProc(hwnd: win32.HWND, msg: c_uint, wparam: win32.WPARAM, lparam: win32.LPARAM) callconv(std.builtin.CallingConvention.c) win32.LRESULT {
     switch (msg) {
@@ -340,6 +342,8 @@ const compute_shader_source: [*:0]const u8 =
     \\uniform float u_vignette;
     \\uniform float u_normal_strength;
     \\uniform float u_denoise;
+    \\uniform float u_fog_density;
+    \\uniform vec3 u_fog_color;
     \\
     \\#define MAX_DEPTH 16
     \\#define BVH_STACK_SIZE 64
@@ -1028,6 +1032,69 @@ const compute_shader_source: [*:0]const u8 =
     \\    return mix(baseResult, mean, varianceStrength * 0.3);
     \\}
     \\
+    \\// ============ VOLUMETRIC FOG & GOD RAYS ============
+    \\
+    \\// Henyey-Greenstein phase function for anisotropic scattering
+    \\float phaseHG(float cosTheta, float g) {
+    \\    float g2 = g * g;
+    \\    float denom = 1.0 + g2 - 2.0 * g * cosTheta;
+    \\    return (1.0 - g2) / (4.0 * PI * pow(denom, 1.5));
+    \\}
+    \\
+    \\// Sample volumetric fog along a ray segment
+    \\vec3 sampleVolume(vec3 ro, vec3 rd, float t_max, vec3 pathColor) {
+    \\    if (u_fog_density <= 0.0) return pathColor;
+    \\
+    \\    // Ray march parameters
+    \\    const int VOL_STEPS = 16;
+    \\    float step_size = min(t_max, 50.0) / float(VOL_STEPS);
+    \\
+    \\    vec3 accumulated_light = vec3(0.0);
+    \\    float transmittance = 1.0;
+    \\
+    \\    // Sun direction for god rays
+    \\    vec3 sun_dir = normalize(vec3(0.5, 0.35, -0.7));
+    \\    vec3 sun_color = vec3(1.0, 0.9, 0.7) * 5.0;
+    \\
+    \\    for (int i = 0; i < VOL_STEPS; i++) {
+    \\        float t = (float(i) + rand()) * step_size;
+    \\        if (t > t_max) break;
+    \\
+    \\        vec3 pos = ro + rd * t;
+    \\
+    \\        // Height-based density falloff (thicker near ground)
+    \\        float height_factor = exp(-max(pos.y, 0.0) * 0.15);
+    \\        float local_density = u_fog_density * height_factor;
+    \\
+    \\        // Extinction
+    \\        float extinction = local_density * step_size;
+    \\        transmittance *= exp(-extinction);
+    \\
+    \\        if (transmittance < 0.01) break;
+    \\
+    \\        // In-scattering: check visibility to sun for god rays
+    \\        HitRecord shadow_rec;
+    \\        bool in_shadow = hit_world_bvh(pos, sun_dir, 0.01, 100.0, shadow_rec);
+    \\
+    \\        if (!in_shadow) {
+    \\            // Phase function for forward scattering (g > 0 = forward)
+    \\            float cosTheta = dot(rd, sun_dir);
+    \\            float phase = phaseHG(cosTheta, 0.6);
+    \\
+    \\            // Add in-scattered light
+    \\            vec3 inscatter = sun_color * phase * local_density * transmittance;
+    \\            accumulated_light += inscatter * step_size;
+    \\        }
+    \\
+    \\        // Ambient in-scattering (sky contribution)
+    \\        vec3 ambient = getSky(vec3(0, 1, 0)) * 0.1;
+    \\        accumulated_light += ambient * u_fog_color * local_density * transmittance * step_size;
+    \\    }
+    \\
+    \\    // Combine: attenuated path color + accumulated fog light
+    \\    return pathColor * transmittance + accumulated_light * u_fog_color;
+    \\}
+    \\
     \\vec3 trace(vec3 ro, vec3 rd) {
     \\    vec3 color = vec3(1.0);
     \\    vec3 light = vec3(0.0);
@@ -1185,7 +1252,12 @@ const compute_shader_source: [*:0]const u8 =
     \\                }
     \\            }
     \\        } else {
-    \\            light += color * getSky(rd);
+    \\            // Ray missed - sample sky with volumetric fog
+    \\            vec3 sky = getSky(rd);
+    \\            if (u_fog_density > 0.0) {
+    \\                sky = sampleVolume(ro, rd, 100.0, sky);
+    \\            }
+    \\            light += color * sky;
     \\            break;
     \\        }
     \\    }
@@ -2152,6 +2224,8 @@ pub fn main() !void {
     const u_vignette_loc = glGetUniformLocation(compute_program, "u_vignette");
     const u_normal_strength_loc = glGetUniformLocation(compute_program, "u_normal_strength");
     const u_denoise_loc = glGetUniformLocation(compute_program, "u_denoise");
+    const u_fog_density_loc = glGetUniformLocation(compute_program, "u_fog_density");
+    const u_fog_color_loc = glGetUniformLocation(compute_program, "u_fog_color");
 
     g_camera_yaw = std.math.atan2(@as(f32, -3.0), @as(f32, -13.0));
 
@@ -2327,6 +2401,15 @@ pub fn main() !void {
             }
             camera_moved = true; g_keys['O'] = false;
         }
+        // P - Volumetric fog density (hold Shift for decrease)
+        if (g_keys['P']) {
+            if (g_keys[0x10]) {
+                g_fog_density = @max(0.0, g_fog_density - 0.01);
+            } else {
+                g_fog_density = @min(0.5, g_fog_density + 0.01);
+            }
+            camera_moved = true; g_keys['P'] = false;
+        }
 
         // Reset accumulation when camera moves
         if (camera_moved) {
@@ -2362,6 +2445,8 @@ pub fn main() !void {
         glUniform1f(u_vignette_loc, g_vignette_strength);
         glUniform1f(u_normal_strength_loc, g_normal_strength);
         glUniform1f(u_denoise_loc, g_denoise_strength);
+        glUniform1f(u_fog_density_loc, g_fog_density);
+        glUniform3f(u_fog_color_loc, g_fog_color[0], g_fog_color[1], g_fog_color[2]);
 
         const groups_x = (RENDER_WIDTH + 15) / 16;
         const groups_y = (RENDER_HEIGHT + 15) / 16;
