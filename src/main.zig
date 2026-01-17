@@ -1,5 +1,13 @@
 const std = @import("std");
 const vec3 = @import("vec3.zig");
+const types = @import("types.zig");
+const bvh = @import("bvh.zig");
+const obj_loader = @import("obj_loader.zig");
+const scene = @import("scene.zig");
+
+const GPUSphere = types.GPUSphere;
+const GPUTriangle = types.GPUTriangle;
+const GPUBVHNode = types.GPUBVHNode;
 
 const win32 = @cImport({
     @cDefine("WIN32_LEAN_AND_MEAN", "1");
@@ -1396,541 +1404,13 @@ const compute_shader_source: [*:0]const u8 =
     \\}
 ;
 
-// ============================================================================
-// GPU DATA STRUCTURES
-// ============================================================================
-const GPUSphere = extern struct {
-    center: [3]f32,
-    radius: f32,
-    albedo: [3]f32,
-    fuzz: f32,
-    ior: f32,
-    emissive: f32,
-    mat_type: i32,
-    pad: f32,
-};
+// GPU data structures imported from types.zig
+// OBJ loader imported from obj_loader.zig
 
-const GPUTriangle = extern struct {
-    v0: [3]f32,
-    mat_type: i32,
-    v1: [3]f32,
-    pad1: f32,
-    v2: [3]f32,
-    pad2: f32,
-    n0: [3]f32,
-    pad3: f32,
-    n1: [3]f32,
-    pad4: f32,
-    n2: [3]f32,
-    pad5: f32,
-    albedo: [3]f32,
-    emissive: f32,
-    // UV coordinates for texture mapping
-    uv0: [2]f32,
-    uv1: [2]f32,
-    uv2: [2]f32,
-    texture_id: i32, // 0=none, 1=checker, 2=brick, 3=marble, 4=wood
-    pad_uv: i32,
-};
+const ObjMesh = obj_loader.ObjMesh;
 
-const GPUBVHNode = extern struct {
-    aabb_min: [3]f32,
-    left_child: i32,
-    aabb_max: [3]f32,
-    right_child: i32,
-};
-
-// ============================================================================
-// OBJ FILE LOADER
-// ============================================================================
-const ObjMesh = struct {
-    triangles: std.ArrayList(GPUTriangle),
-
-    fn deinit(self: *ObjMesh) void {
-        self.triangles.deinit();
-    }
-};
-
-fn loadObj(allocator: std.mem.Allocator, path: []const u8, transform: struct {
-    scale: f32 = 1.0,
-    offset: Vec3 = Vec3.init(0, 0, 0),
-    albedo: [3]f32 = .{ 0.8, 0.8, 0.8 },
-    mat_type: i32 = 0,
-    emissive: f32 = 0.0,
-    texture_id: i32 = 0, // 0=none, 1=checker, 2=brick, 3=marble, 4=wood
-}) !ObjMesh {
-    var mesh = ObjMesh{
-        .triangles = std.ArrayList(GPUTriangle).init(allocator),
-    };
-    errdefer mesh.deinit();
-
-    // Read file
-    const file = std.fs.cwd().openFile(path, .{}) catch |err| {
-        std.debug.print("Failed to open OBJ file '{s}': {}\n", .{ path, err });
-        return err;
-    };
-    defer file.close();
-
-    const content = file.readToEndAlloc(allocator, 50 * 1024 * 1024) catch |err| {
-        std.debug.print("Failed to read OBJ file: {}\n", .{err});
-        return err;
-    };
-    defer allocator.free(content);
-
-    // Parse vertices, normals, and texture coordinates
-    var vertices = std.ArrayList(Vec3).init(allocator);
-    defer vertices.deinit();
-    var normals = std.ArrayList(Vec3).init(allocator);
-    defer normals.deinit();
-    // UV coords stored as Vec3 (z unused, but reusing type)
-    const Vec2 = struct { u: f32, v: f32 };
-    var texcoords = std.ArrayList(Vec2).init(allocator);
-    defer texcoords.deinit();
-
-    var lines = std.mem.splitScalar(u8, content, '\n');
-    while (lines.next()) |line| {
-        const trimmed = std.mem.trim(u8, line, " \t\r");
-        if (trimmed.len == 0 or trimmed[0] == '#') continue;
-
-        var parts = std.mem.splitScalar(u8, trimmed, ' ');
-        const cmd = parts.next() orelse continue;
-
-        if (std.mem.eql(u8, cmd, "v")) {
-            // Vertex position
-            const x = std.fmt.parseFloat(f32, parts.next() orelse continue) catch continue;
-            const y = std.fmt.parseFloat(f32, parts.next() orelse continue) catch continue;
-            const z = std.fmt.parseFloat(f32, parts.next() orelse continue) catch continue;
-            try vertices.append(Vec3.init(
-                x * transform.scale + transform.offset.x,
-                y * transform.scale + transform.offset.y,
-                z * transform.scale + transform.offset.z,
-            ));
-        } else if (std.mem.eql(u8, cmd, "vt")) {
-            // Texture coordinate
-            const u = std.fmt.parseFloat(f32, parts.next() orelse continue) catch continue;
-            const v = std.fmt.parseFloat(f32, parts.next() orelse "0") catch 0.0;
-            try texcoords.append(.{ .u = u, .v = v });
-        } else if (std.mem.eql(u8, cmd, "vn")) {
-            // Vertex normal
-            const x = std.fmt.parseFloat(f32, parts.next() orelse continue) catch continue;
-            const y = std.fmt.parseFloat(f32, parts.next() orelse continue) catch continue;
-            const z = std.fmt.parseFloat(f32, parts.next() orelse continue) catch continue;
-            try normals.append(Vec3.init(x, y, z).normalize());
-        } else if (std.mem.eql(u8, cmd, "f")) {
-            // Face - collect all vertex indices
-            var face_verts: [16]usize = undefined;
-            var face_norms: [16]?usize = undefined;
-            var face_uvs: [16]?usize = undefined;
-            var face_count: usize = 0;
-
-            while (parts.next()) |face_part| {
-                if (face_part.len == 0) continue;
-                if (face_count >= 16) break;
-
-                // Parse v/vt/vn or v//vn or v
-                var indices = std.mem.splitScalar(u8, face_part, '/');
-                const v_str = indices.next() orelse continue;
-                const v_idx = (std.fmt.parseInt(usize, v_str, 10) catch continue);
-                if (v_idx == 0 or v_idx > vertices.items.len) continue;
-                face_verts[face_count] = v_idx - 1;
-
-                // Texture coordinate index (optional)
-                if (indices.next()) |vt_str| {
-                    if (vt_str.len > 0) {
-                        const vt_idx = std.fmt.parseInt(usize, vt_str, 10) catch 0;
-                        if (vt_idx > 0 and vt_idx <= texcoords.items.len) {
-                            face_uvs[face_count] = vt_idx - 1;
-                        } else {
-                            face_uvs[face_count] = null;
-                        }
-                    } else {
-                        face_uvs[face_count] = null;
-                    }
-                } else {
-                    face_uvs[face_count] = null;
-                }
-
-                // Normal index (optional)
-                if (indices.next()) |n_str| {
-                    if (n_str.len > 0) {
-                        const n_idx = std.fmt.parseInt(usize, n_str, 10) catch 0;
-                        if (n_idx > 0 and n_idx <= normals.items.len) {
-                            face_norms[face_count] = n_idx - 1;
-                        } else {
-                            face_norms[face_count] = null;
-                        }
-                    } else {
-                        face_norms[face_count] = null;
-                    }
-                } else {
-                    face_norms[face_count] = null;
-                }
-
-                face_count += 1;
-            }
-
-            // Triangulate face (fan triangulation)
-            if (face_count >= 3) {
-                var i: usize = 1;
-                while (i < face_count - 1) : (i += 1) {
-                    const v0 = vertices.items[face_verts[0]];
-                    const v1 = vertices.items[face_verts[i]];
-                    const v2 = vertices.items[face_verts[i + 1]];
-
-                    // Calculate face normal if not provided
-                    const edge1 = v1.sub(v0);
-                    const edge2 = v2.sub(v0);
-                    const face_normal = edge1.cross(edge2).normalize();
-
-                    const n0 = if (face_norms[0]) |ni| normals.items[ni] else face_normal;
-                    const n1 = if (face_norms[i]) |ni| normals.items[ni] else face_normal;
-                    const n2 = if (face_norms[i + 1]) |ni| normals.items[ni] else face_normal;
-
-                    // Get UV coords (default to position-based if not provided)
-                    const default_uv = Vec2{ .u = 0.5, .v = 0.5 };
-                    const uv0 = if (face_uvs[0]) |ti| texcoords.items[ti] else default_uv;
-                    const uv1 = if (face_uvs[i]) |ti| texcoords.items[ti] else default_uv;
-                    const uv2 = if (face_uvs[i + 1]) |ti| texcoords.items[ti] else default_uv;
-
-                    try mesh.triangles.append(.{
-                        .v0 = .{ v0.x, v0.y, v0.z },
-                        .v1 = .{ v1.x, v1.y, v1.z },
-                        .v2 = .{ v2.x, v2.y, v2.z },
-                        .n0 = .{ n0.x, n0.y, n0.z },
-                        .n1 = .{ n1.x, n1.y, n1.z },
-                        .n2 = .{ n2.x, n2.y, n2.z },
-                        .albedo = transform.albedo,
-                        .mat_type = transform.mat_type,
-                        .emissive = transform.emissive,
-                        .pad1 = 0,
-                        .pad2 = 0,
-                        .pad3 = 0,
-                        .pad4 = 0,
-                        .pad5 = 0,
-                        .uv0 = .{ uv0.u, uv0.v },
-                        .uv1 = .{ uv1.u, uv1.v },
-                        .uv2 = .{ uv2.u, uv2.v },
-                        .texture_id = transform.texture_id,
-                        .pad_uv = 0,
-                    });
-                }
-            }
-        }
-    }
-
-    std.debug.print("Loaded OBJ '{s}': {} vertices, {} normals, {} texcoords, {} triangles\n", .{ path, vertices.items.len, normals.items.len, texcoords.items.len, mesh.triangles.items.len });
-    return mesh;
-}
-
-fn createIcosphere(triangles: *std.ArrayList(GPUTriangle), center: Vec3, radius: f32, subdivisions: u32, material: struct {
-    albedo: [3]f32,
-    mat_type: i32,
-    emissive: f32,
-}) !void {
-    // Golden ratio for icosahedron
-    const phi: f32 = (1.0 + @sqrt(5.0)) / 2.0;
-    const a: f32 = 1.0;
-    const b: f32 = 1.0 / phi;
-
-    // Icosahedron vertices (normalized)
-    const base_verts = [12]Vec3{
-        Vec3.init(0, b, -a).normalize(),
-        Vec3.init(b, a, 0).normalize(),
-        Vec3.init(-b, a, 0).normalize(),
-        Vec3.init(0, b, a).normalize(),
-        Vec3.init(0, -b, a).normalize(),
-        Vec3.init(-a, 0, b).normalize(),
-        Vec3.init(0, -b, -a).normalize(),
-        Vec3.init(a, 0, -b).normalize(),
-        Vec3.init(a, 0, b).normalize(),
-        Vec3.init(-a, 0, -b).normalize(),
-        Vec3.init(b, -a, 0).normalize(),
-        Vec3.init(-b, -a, 0).normalize(),
-    };
-
-    // Icosahedron faces (20 triangles)
-    const faces = [20][3]u8{
-        .{ 2, 1, 0 },  .{ 1, 2, 3 },  .{ 5, 4, 3 },  .{ 4, 8, 3 },
-        .{ 7, 6, 0 },  .{ 6, 9, 0 },  .{ 11, 10, 4 }, .{ 10, 11, 6 },
-        .{ 9, 5, 2 },  .{ 5, 9, 11 }, .{ 8, 7, 1 },  .{ 7, 8, 10 },
-        .{ 2, 5, 3 },  .{ 8, 1, 3 },  .{ 9, 2, 0 },  .{ 1, 7, 0 },
-        .{ 11, 9, 6 }, .{ 7, 10, 6 }, .{ 5, 11, 4 }, .{ 10, 8, 4 },
-    };
-
-    // Helper to add a subdivided triangle
-    const SubdivideHelper = struct {
-        fn subdivide(tris: *std.ArrayList(GPUTriangle), v0: Vec3, v1: Vec3, v2: Vec3, depth: u32, c: Vec3, r: f32, mat: struct {
-            albedo: [3]f32,
-            mat_type: i32,
-            emissive: f32,
-        }) !void {
-            if (depth == 0) {
-                // Add final triangle
-                const p0 = c.add(v0.scale(r));
-                const p1 = c.add(v1.scale(r));
-                const p2 = c.add(v2.scale(r));
-                // Generate spherical UVs from normals
-                const pi = 3.14159265;
-                const uv_0 = .{ 0.5 + std.math.atan2(v0.z, v0.x) / (2.0 * pi), 0.5 - std.math.asin(v0.y) / pi };
-                const uv_1 = .{ 0.5 + std.math.atan2(v1.z, v1.x) / (2.0 * pi), 0.5 - std.math.asin(v1.y) / pi };
-                const uv_2 = .{ 0.5 + std.math.atan2(v2.z, v2.x) / (2.0 * pi), 0.5 - std.math.asin(v2.y) / pi };
-                try tris.append(.{
-                    .v0 = .{ p0.x, p0.y, p0.z },
-                    .v1 = .{ p1.x, p1.y, p1.z },
-                    .v2 = .{ p2.x, p2.y, p2.z },
-                    .n0 = .{ v0.x, v0.y, v0.z },
-                    .n1 = .{ v1.x, v1.y, v1.z },
-                    .n2 = .{ v2.x, v2.y, v2.z },
-                    .albedo = mat.albedo,
-                    .mat_type = mat.mat_type,
-                    .emissive = mat.emissive,
-                    .pad1 = 0,
-                    .pad2 = 0,
-                    .pad3 = 0,
-                    .pad4 = 0,
-                    .pad5 = 0,
-                    .uv0 = uv_0,
-                    .uv1 = uv_1,
-                    .uv2 = uv_2,
-                    .texture_id = 0, // No texture by default for icospheres
-                    .pad_uv = 0,
-                });
-            } else {
-                // Subdivide
-                const m01 = v0.add(v1).scale(0.5).normalize();
-                const m12 = v1.add(v2).scale(0.5).normalize();
-                const m20 = v2.add(v0).scale(0.5).normalize();
-                try subdivide(tris, v0, m01, m20, depth - 1, c, r, mat);
-                try subdivide(tris, m01, v1, m12, depth - 1, c, r, mat);
-                try subdivide(tris, m20, m12, v2, depth - 1, c, r, mat);
-                try subdivide(tris, m01, m12, m20, depth - 1, c, r, mat);
-            }
-        }
-    };
-
-    // Generate all triangles
-    for (faces) |face| {
-        try SubdivideHelper.subdivide(triangles, base_verts[face[0]], base_verts[face[1]], base_verts[face[2]], subdivisions, center, radius, material);
-    }
-}
-
-// ============================================================================
-// BVH BUILDING
-// ============================================================================
-const AABB = struct {
-    min: Vec3,
-    max: Vec3,
-
-    fn empty() AABB {
-        return .{
-            .min = Vec3.init(std.math.inf(f32), std.math.inf(f32), std.math.inf(f32)),
-            .max = Vec3.init(-std.math.inf(f32), -std.math.inf(f32), -std.math.inf(f32)),
-        };
-    }
-
-    fn expand(self: *AABB, point: Vec3) void {
-        self.min.x = @min(self.min.x, point.x);
-        self.min.y = @min(self.min.y, point.y);
-        self.min.z = @min(self.min.z, point.z);
-        self.max.x = @max(self.max.x, point.x);
-        self.max.y = @max(self.max.y, point.y);
-        self.max.z = @max(self.max.z, point.z);
-    }
-
-    fn expandSphere(self: *AABB, center: Vec3, radius: f32) void {
-        self.expand(Vec3.init(center.x - radius, center.y - radius, center.z - radius));
-        self.expand(Vec3.init(center.x + radius, center.y + radius, center.z + radius));
-    }
-
-    fn expandTriangle(self: *AABB, tri: GPUTriangle) void {
-        self.expand(Vec3.init(tri.v0[0], tri.v0[1], tri.v0[2]));
-        self.expand(Vec3.init(tri.v1[0], tri.v1[1], tri.v1[2]));
-        self.expand(Vec3.init(tri.v2[0], tri.v2[1], tri.v2[2]));
-    }
-
-    fn triangleCenter(tri: GPUTriangle) Vec3 {
-        return Vec3.init(
-            (tri.v0[0] + tri.v1[0] + tri.v2[0]) / 3.0,
-            (tri.v0[1] + tri.v1[1] + tri.v2[1]) / 3.0,
-            (tri.v0[2] + tri.v1[2] + tri.v2[2]) / 3.0,
-        );
-    }
-
-    fn merge(a: AABB, b: AABB) AABB {
-        return .{
-            .min = Vec3.init(@min(a.min.x, b.min.x), @min(a.min.y, b.min.y), @min(a.min.z, b.min.z)),
-            .max = Vec3.init(@max(a.max.x, b.max.x), @max(a.max.y, b.max.y), @max(a.max.z, b.max.z)),
-        };
-    }
-};
-
-fn buildBVH(
-    allocator: std.mem.Allocator,
-    spheres: []const GPUSphere,
-    indices: []u32,
-    nodes: *std.ArrayList(GPUBVHNode),
-) !u32 {
-    const node_idx: u32 = @intCast(nodes.items.len);
-    try nodes.append(allocator, undefined);
-
-    if (indices.len == 1) {
-        // Leaf node
-        const s = spheres[indices[0]];
-        var aabb = AABB.empty();
-        aabb.expandSphere(Vec3.init(s.center[0], s.center[1], s.center[2]), s.radius);
-
-        nodes.items[node_idx] = .{
-            .aabb_min = .{ aabb.min.x, aabb.min.y, aabb.min.z },
-            .left_child = -1,
-            .aabb_max = .{ aabb.max.x, aabb.max.y, aabb.max.z },
-            .right_child = @intCast(indices[0]),
-        };
-        return node_idx;
-    }
-
-    // Compute bounding box of all spheres
-    var bounds = AABB.empty();
-    for (indices) |idx| {
-        const s = spheres[idx];
-        bounds.expandSphere(Vec3.init(s.center[0], s.center[1], s.center[2]), s.radius);
-    }
-
-    // Find longest axis
-    const extent = Vec3.init(
-        bounds.max.x - bounds.min.x,
-        bounds.max.y - bounds.min.y,
-        bounds.max.z - bounds.min.z,
-    );
-    var axis: usize = 0;
-    if (extent.y > extent.x) axis = 1;
-    if (extent.z > (if (axis == 0) extent.x else extent.y)) axis = 2;
-
-    // Sort by axis
-    const SortContext = struct {
-        spheres: []const GPUSphere,
-        axis: usize,
-    };
-    const ctx = SortContext{ .spheres = spheres, .axis = axis };
-
-    std.mem.sort(u32, indices, ctx, struct {
-        fn lessThan(c: SortContext, a: u32, b: u32) bool {
-            const ca = c.spheres[a].center[c.axis];
-            const cb = c.spheres[b].center[c.axis];
-            return ca < cb;
-        }
-    }.lessThan);
-
-    // Split in half
-    const mid = indices.len / 2;
-    const left_idx = try buildBVH(allocator, spheres, indices[0..mid], nodes);
-    const right_idx = try buildBVH(allocator, spheres, indices[mid..], nodes);
-
-    // Merge bounds from children
-    const left_node = nodes.items[left_idx];
-    const right_node = nodes.items[right_idx];
-    const left_aabb = AABB{
-        .min = Vec3.init(left_node.aabb_min[0], left_node.aabb_min[1], left_node.aabb_min[2]),
-        .max = Vec3.init(left_node.aabb_max[0], left_node.aabb_max[1], left_node.aabb_max[2]),
-    };
-    const right_aabb = AABB{
-        .min = Vec3.init(right_node.aabb_min[0], right_node.aabb_min[1], right_node.aabb_min[2]),
-        .max = Vec3.init(right_node.aabb_max[0], right_node.aabb_max[1], right_node.aabb_max[2]),
-    };
-    const merged = AABB.merge(left_aabb, right_aabb);
-
-    nodes.items[node_idx] = .{
-        .aabb_min = .{ merged.min.x, merged.min.y, merged.min.z },
-        .left_child = @intCast(left_idx),
-        .aabb_max = .{ merged.max.x, merged.max.y, merged.max.z },
-        .right_child = @intCast(right_idx),
-    };
-
-    return node_idx;
-}
-
-fn buildTriangleBVH(
-    allocator: std.mem.Allocator,
-    triangles: []const GPUTriangle,
-    indices: []u32,
-    nodes: *std.ArrayList(GPUBVHNode),
-) !u32 {
-    const node_idx: u32 = @intCast(nodes.items.len);
-    try nodes.append(allocator, undefined);
-
-    if (indices.len == 1) {
-        // Leaf node
-        var aabb = AABB.empty();
-        aabb.expandTriangle(triangles[indices[0]]);
-
-        nodes.items[node_idx] = .{
-            .aabb_min = .{ aabb.min.x, aabb.min.y, aabb.min.z },
-            .left_child = -1,
-            .aabb_max = .{ aabb.max.x, aabb.max.y, aabb.max.z },
-            .right_child = @intCast(indices[0]),
-        };
-        return node_idx;
-    }
-
-    // Compute bounding box of all triangles
-    var bounds = AABB.empty();
-    for (indices) |idx| {
-        bounds.expandTriangle(triangles[idx]);
-    }
-
-    // Find longest axis
-    const extent = Vec3.init(
-        bounds.max.x - bounds.min.x,
-        bounds.max.y - bounds.min.y,
-        bounds.max.z - bounds.min.z,
-    );
-    var axis: usize = 0;
-    if (extent.y > extent.x) axis = 1;
-    if (extent.z > (if (axis == 0) extent.x else extent.y)) axis = 2;
-
-    // Sort by centroid along axis
-    const SortContext = struct {
-        triangles: []const GPUTriangle,
-        axis: usize,
-    };
-    const ctx = SortContext{ .triangles = triangles, .axis = axis };
-
-    std.mem.sort(u32, indices, ctx, struct {
-        fn lessThan(c: SortContext, a: u32, b: u32) bool {
-            const ta = c.triangles[a];
-            const tb = c.triangles[b];
-            const ca = (ta.v0[c.axis] + ta.v1[c.axis] + ta.v2[c.axis]) / 3.0;
-            const cb = (tb.v0[c.axis] + tb.v1[c.axis] + tb.v2[c.axis]) / 3.0;
-            return ca < cb;
-        }
-    }.lessThan);
-
-    // Split in half
-    const mid = indices.len / 2;
-    const left_idx = try buildTriangleBVH(allocator, triangles, indices[0..mid], nodes);
-    const right_idx = try buildTriangleBVH(allocator, triangles, indices[mid..], nodes);
-
-    // Merge bounds from children
-    const left_node = nodes.items[left_idx];
-    const right_node = nodes.items[right_idx];
-    const left_aabb = AABB{
-        .min = Vec3.init(left_node.aabb_min[0], left_node.aabb_min[1], left_node.aabb_min[2]),
-        .max = Vec3.init(left_node.aabb_max[0], left_node.aabb_max[1], left_node.aabb_max[2]),
-    };
-    const right_aabb = AABB{
-        .min = Vec3.init(right_node.aabb_min[0], right_node.aabb_min[1], right_node.aabb_min[2]),
-        .max = Vec3.init(right_node.aabb_max[0], right_node.aabb_max[1], right_node.aabb_max[2]),
-    };
-    const merged = AABB.merge(left_aabb, right_aabb);
-
-    nodes.items[node_idx] = .{
-        .aabb_min = .{ merged.min.x, merged.min.y, merged.min.z },
-        .left_child = @intCast(left_idx),
-        .aabb_max = .{ merged.max.x, merged.max.y, merged.max.z },
-        .right_child = @intCast(right_idx),
-    };
-
-    return node_idx;
-}
+// Removed loadObj - now in obj_loader.zig
+// Lines removed: loadObj, createIcosphere, AABB, buildBVH, buildTriangleBVH
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -2028,7 +1508,7 @@ pub fn main() !void {
     // Create spheres
     var spheres: std.ArrayList(GPUSphere) = .empty;
     defer spheres.deinit(allocator);
-    try setupScene(allocator, &spheres);
+    try scene.setupScene(allocator, &spheres);
 
     // Build BVH
     var indices = try allocator.alloc(u32, spheres.items.len);
@@ -2037,7 +1517,7 @@ pub fn main() !void {
 
     var bvh_nodes: std.ArrayList(GPUBVHNode) = .empty;
     defer bvh_nodes.deinit(allocator);
-    _ = try buildBVH(allocator, spheres.items, indices, &bvh_nodes);
+    _ = try bvh.buildBVH(allocator, spheres.items, indices, &bvh_nodes);
 
     std.debug.print("Scene: {} spheres, {} BVH nodes\n", .{ spheres.items.len, bvh_nodes.items.len });
 
@@ -2077,7 +1557,7 @@ pub fn main() !void {
 
     // Try loading OBJ files from models folder
     // Model 1: Golden torus (center)
-    if (loadObj(allocator, "models/torus.obj", .{
+    if (obj_loader.loadObj(allocator, "models/torus.obj", .{
         .scale = 0.8,
         .offset = Vec3.init(0.0, 1.2, -5.0),
         .albedo = .{ 1.0, 0.84, 0.0 }, // Gold
@@ -2089,7 +1569,7 @@ pub fn main() !void {
     } else |_| {}
 
     // Model 2: Glass diamond (left)
-    if (loadObj(allocator, "models/diamond.obj", .{
+    if (obj_loader.loadObj(allocator, "models/diamond.obj", .{
         .scale = 0.6,
         .offset = Vec3.init(-2.5, 1.0, -4.0),
         .albedo = .{ 0.95, 0.95, 1.0 }, // Slight blue tint
@@ -2101,7 +1581,7 @@ pub fn main() !void {
     } else |_| {}
 
     // Model 3: Brick pyramid (right) - shows brick texture
-    if (loadObj(allocator, "models/pyramid.obj", .{
+    if (obj_loader.loadObj(allocator, "models/pyramid.obj", .{
         .scale = 0.7,
         .offset = Vec3.init(2.5, 0.7, -4.0),
         .albedo = .{ 0.85, 0.5, 0.4 }, // Brick base color
@@ -2114,7 +1594,7 @@ pub fn main() !void {
     } else |_| {}
 
     // Model 4: Checker cube (back) - shows checker texture
-    if (loadObj(allocator, "models/cube.obj", .{
+    if (obj_loader.loadObj(allocator, "models/cube.obj", .{
         .scale = 1.2,
         .offset = Vec3.init(0.0, 0.6, -8.0),
         .albedo = .{ 0.9, 0.9, 0.95 }, // Light gray
@@ -2131,21 +1611,21 @@ pub fn main() !void {
         std.debug.print("No OBJ files found, creating procedural meshes\n", .{});
 
         // Gold icosphere (center)
-        try createIcosphere(&triangles, Vec3.init(0.0, 1.5, -5.0), 1.0, 2, .{
+        try obj_loader.createIcosphere(&triangles, Vec3.init(0.0, 1.5, -5.0), 1.0, 2, .{
             .albedo = .{ 1.0, 0.84, 0.0 },
             .mat_type = 1,
             .emissive = 0.0,
         });
 
         // Glass icosphere (left)
-        try createIcosphere(&triangles, Vec3.init(-2.5, 1.0, -4.0), 0.8, 2, .{
+        try obj_loader.createIcosphere(&triangles, Vec3.init(-2.5, 1.0, -4.0), 0.8, 2, .{
             .albedo = .{ 1.0, 1.0, 1.0 },
             .mat_type = 2,
             .emissive = 0.0,
         });
 
         // Red diffuse icosphere (right)
-        try createIcosphere(&triangles, Vec3.init(2.5, 1.0, -4.0), 0.8, 2, .{
+        try obj_loader.createIcosphere(&triangles, Vec3.init(2.5, 1.0, -4.0), 0.8, 2, .{
             .albedo = .{ 0.8, 0.2, 0.2 },
             .mat_type = 0,
             .emissive = 0.0,
@@ -2179,7 +1659,7 @@ pub fn main() !void {
         for (0..triangles.items.len) |i| {
             tri_indices[i] = @intCast(i);
         }
-        _ = try buildTriangleBVH(allocator, triangles.items, tri_indices, &tri_bvh_nodes);
+        _ = try bvh.buildTriangleBVH(allocator, triangles.items, tri_indices, &tri_bvh_nodes);
         std.debug.print("Triangle BVH: {} nodes\n", .{tri_bvh_nodes.items.len});
     }
 
@@ -2525,109 +2005,4 @@ fn createComputeShader() ?GLuint {
     return program;
 }
 
-fn setupScene(allocator: std.mem.Allocator, spheres: *std.ArrayList(GPUSphere)) !void {
-    // Ground - subtle checker-like appearance through albedo
-    try spheres.append(allocator, .{ .center = .{ 0, -1000, 0 }, .radius = 1000, .albedo = .{ 0.4, 0.4, 0.45 }, .fuzz = 0, .ior = 0, .emissive = 0, .mat_type = 0, .pad = 0 });
-
-    // === HERO SPHERES - The Stars of the Show ===
-
-    // Center: Perfect crystal glass sphere
-    try spheres.append(allocator, .{ .center = .{ 0, 1.2, 0 }, .radius = 1.2, .albedo = .{ 1, 1, 1 }, .fuzz = 0, .ior = 1.52, .emissive = 0, .mat_type = 2, .pad = 0 });
-
-    // Left: Rich matte terracotta
-    try spheres.append(allocator, .{ .center = .{ -4, 1, 0 }, .radius = 1.0, .albedo = .{ 0.8, 0.3, 0.2 }, .fuzz = 0, .ior = 0, .emissive = 0, .mat_type = 0, .pad = 0 });
-
-    // Right: Polished gold mirror
-    try spheres.append(allocator, .{ .center = .{ 4, 1, 0 }, .radius = 1.0, .albedo = .{ 1.0, 0.85, 0.57 }, .fuzz = 0.0, .ior = 0, .emissive = 0, .mat_type = 1, .pad = 0 });
-
-    // === ACCENT SPHERES ===
-
-    // Chrome sphere - perfect mirror
-    try spheres.append(allocator, .{ .center = .{ -2, 0.5, 2 }, .radius = 0.5, .albedo = .{ 0.95, 0.95, 0.97 }, .fuzz = 0.0, .ior = 0, .emissive = 0, .mat_type = 1, .pad = 0 });
-
-    // Copper sphere - warm metallic
-    try spheres.append(allocator, .{ .center = .{ 2.5, 0.6, 1.5 }, .radius = 0.6, .albedo = .{ 0.95, 0.64, 0.54 }, .fuzz = 0.02, .ior = 0, .emissive = 0, .mat_type = 1, .pad = 0 });
-
-    // Emerald glass
-    try spheres.append(allocator, .{ .center = .{ -1.5, 0.4, -2 }, .radius = 0.4, .albedo = .{ 0.8, 1, 0.8 }, .fuzz = 0, .ior = 1.65, .emissive = 0, .mat_type = 2, .pad = 0 });
-
-    // Sapphire glass
-    try spheres.append(allocator, .{ .center = .{ 1.5, 0.45, -1.8 }, .radius = 0.45, .albedo = .{ 0.8, 0.85, 1 }, .fuzz = 0, .ior = 1.77, .emissive = 0, .mat_type = 2, .pad = 0 });
-
-    // === DRAMATIC LIGHTING ===
-
-    // Main soft light (sun-like, high up)
-    try spheres.append(allocator, .{ .center = .{ 5, 12, -5 }, .radius = 4.0, .albedo = .{ 1.0, 0.95, 0.85 }, .fuzz = 0, .ior = 0, .emissive = 10.0, .mat_type = 3, .pad = 0 });
-
-    // Accent blue light
-    try spheres.append(allocator, .{ .center = .{ -8, 4, 3 }, .radius = 1.5, .albedo = .{ 0.4, 0.6, 1.0 }, .fuzz = 0, .ior = 0, .emissive = 6.0, .mat_type = 3, .pad = 0 });
-
-    // Warm rim light
-    try spheres.append(allocator, .{ .center = .{ 8, 3, 5 }, .radius = 1.0, .albedo = .{ 1.0, 0.6, 0.3 }, .fuzz = 0, .ior = 0, .emissive = 5.0, .mat_type = 3, .pad = 0 });
-
-    // === MORE SHOWCASE SPHERES ===
-
-    // Brushed steel
-    try spheres.append(allocator, .{ .center = .{ -7, 1.3, -2 }, .radius = 1.3, .albedo = .{ 0.7, 0.7, 0.75 }, .fuzz = 0.15, .ior = 0, .emissive = 0, .mat_type = 1, .pad = 0 });
-
-    // Rose gold
-    try spheres.append(allocator, .{ .center = .{ 7, 0.9, 2 }, .radius = 0.9, .albedo = .{ 0.92, 0.65, 0.6 }, .fuzz = 0.03, .ior = 0, .emissive = 0, .mat_type = 1, .pad = 0 });
-
-    // Deep blue matte
-    try spheres.append(allocator, .{ .center = .{ 0, 0.7, 4 }, .radius = 0.7, .albedo = .{ 0.15, 0.2, 0.5 }, .fuzz = 0, .ior = 0, .emissive = 0, .mat_type = 0, .pad = 0 });
-
-    // Large background glass
-    try spheres.append(allocator, .{ .center = .{ -5, 2, -8 }, .radius = 2.0, .albedo = .{ 1, 1, 1 }, .fuzz = 0, .ior = 1.45, .emissive = 0, .mat_type = 2, .pad = 0 });
-
-    // === SUBSURFACE SCATTERING SHOWCASE ===
-
-    // Jade sphere - green SSS
-    try spheres.append(allocator, .{ .center = .{ 2.5, 0.8, 2.5 }, .radius = 0.8, .albedo = .{ 0.3, 0.7, 0.4 }, .fuzz = 0.15, .ior = 0, .emissive = 0, .mat_type = 4, .pad = 0 });
-
-    // Wax/candle - warm SSS
-    try spheres.append(allocator, .{ .center = .{ -2.5, 0.6, 3 }, .radius = 0.6, .albedo = .{ 0.9, 0.7, 0.5 }, .fuzz = 0.2, .ior = 0, .emissive = 0, .mat_type = 4, .pad = 0 });
-
-    // Skin-like - pinkish SSS
-    try spheres.append(allocator, .{ .center = .{ 5, 0.7, -3 }, .radius = 0.7, .albedo = .{ 0.9, 0.6, 0.5 }, .fuzz = 0.1, .ior = 0, .emissive = 0, .mat_type = 4, .pad = 0 });
-
-    // Marble - white with subtle SSS
-    try spheres.append(allocator, .{ .center = .{ -6, 0.9, 3 }, .radius = 0.9, .albedo = .{ 0.95, 0.93, 0.9 }, .fuzz = 0.08, .ior = 0, .emissive = 0, .mat_type = 4, .pad = 0 });
-
-    // Random spheres - now we can have more with BVH!
-    var prng = std.Random.DefaultPrng.init(42);
-    var rng = prng.random();
-
-    var a: i32 = -11;
-    while (a < 11) : (a += 1) {
-        var b: i32 = -11;
-        while (b < 11) : (b += 1) {
-            const choose_mat = vec3.randomFloat(&rng);
-            const center_x = @as(f32, @floatFromInt(a)) + 0.9 * vec3.randomFloat(&rng);
-            const center_z = @as(f32, @floatFromInt(b)) + 0.9 * vec3.randomFloat(&rng);
-            const center = Vec3.init(center_x, 0.2, center_z);
-
-            if (center.sub(Vec3.init(4, 0.2, 0)).length() < 0.9) continue;
-            if (center.sub(Vec3.init(-4, 0.2, 0)).length() < 0.9) continue;
-            if (center.sub(Vec3.init(0, 0.2, 0)).length() < 0.9) continue;
-
-            if (choose_mat < 0.65) {
-                const albedo = vec3.randomVec3(&rng).mul(vec3.randomVec3(&rng));
-                try spheres.append(allocator, .{ .center = .{ center_x, 0.2, center_z }, .radius = 0.2, .albedo = .{ albedo.x, albedo.y, albedo.z }, .fuzz = 0, .ior = 0, .emissive = 0, .mat_type = 0, .pad = 0 });
-            } else if (choose_mat < 0.85) {
-                const albedo = vec3.randomVec3Range(&rng, 0.5, 1);
-                const fuzz = vec3.randomFloatRange(&rng, 0, 0.3);
-                try spheres.append(allocator, .{ .center = .{ center_x, 0.2, center_z }, .radius = 0.2, .albedo = .{ albedo.x, albedo.y, albedo.z }, .fuzz = fuzz, .ior = 0, .emissive = 0, .mat_type = 1, .pad = 0 });
-            } else if (choose_mat < 0.92) {
-                try spheres.append(allocator, .{ .center = .{ center_x, 0.2, center_z }, .radius = 0.2, .albedo = .{ 1, 1, 1 }, .fuzz = 0, .ior = 1.5, .emissive = 0, .mat_type = 2, .pad = 0 });
-            } else if (choose_mat < 0.97) {
-                // SSS material - random translucent colors
-                const sss_color = vec3.randomVec3Range(&rng, 0.4, 0.95);
-                const scatter = vec3.randomFloatRange(&rng, 0.08, 0.25);
-                try spheres.append(allocator, .{ .center = .{ center_x, 0.2, center_z }, .radius = 0.2, .albedo = .{ sss_color.x, sss_color.y, sss_color.z }, .fuzz = scatter, .ior = 0, .emissive = 0, .mat_type = 4, .pad = 0 });
-            } else {
-                const light_color = vec3.randomVec3Range(&rng, 0.5, 1);
-                try spheres.append(allocator, .{ .center = .{ center_x, 0.2, center_z }, .radius = 0.2, .albedo = .{ light_color.x, light_color.y, light_color.z }, .fuzz = 0, .ior = 0, .emissive = 3.0, .mat_type = 3, .pad = 0 });
-            }
-        }
-    }
-}
+// setupScene moved to scene.zig
