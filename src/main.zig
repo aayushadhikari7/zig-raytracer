@@ -147,6 +147,7 @@ var g_roughness_mult: f32 = 1.0;
 var g_exposure: f32 = 1.0;
 var g_vignette_strength: f32 = 0.15;
 var g_normal_strength: f32 = 1.5; // Normal map strength
+var g_denoise_strength: f32 = 0.5; // Denoising strength (0 = off)
 
 fn windowProc(hwnd: win32.HWND, msg: c_uint, wparam: win32.WPARAM, lparam: win32.LPARAM) callconv(std.builtin.CallingConvention.c) win32.LRESULT {
     switch (msg) {
@@ -338,6 +339,7 @@ const compute_shader_source: [*:0]const u8 =
     \\uniform float u_exposure;
     \\uniform float u_vignette;
     \\uniform float u_normal_strength;
+    \\uniform float u_denoise;
     \\
     \\#define MAX_DEPTH 16
     \\#define BVH_STACK_SIZE 64
@@ -944,6 +946,88 @@ const compute_shader_source: [*:0]const u8 =
     \\    return normalize(TBN * tangentNormal);
     \\}
     \\
+    \\// ============ TEMPORAL/SPATIAL DENOISING ============
+    \\
+    \\// Edge-aware spatial denoising using bilateral filtering
+    \\vec3 spatialDenoise(ivec2 pixel, vec3 centerColor, float sampleCount) {
+    \\    if (u_denoise <= 0.0) return centerColor;
+    \\
+    \\    // Adaptive kernel - larger at low sample counts
+    \\    float adaptiveStrength = u_denoise * (1.0 / (1.0 + sampleCount * 0.1));
+    \\    if (adaptiveStrength < 0.01) return centerColor;
+    \\
+    \\    float centerLum = dot(centerColor, vec3(0.299, 0.587, 0.114));
+    \\
+    \\    // 3x3 edge-aware filter
+    \\    vec3 sum = centerColor;
+    \\    float weightSum = 1.0;
+    \\
+    \\    // Spatial sigma (pixels)
+    \\    float sigmaSpatial = 1.5;
+    \\    // Range sigma (luminance difference)
+    \\    float sigmaRange = 0.1 + (1.0 - adaptiveStrength) * 0.3;
+    \\
+    \\    for (int dy = -1; dy <= 1; dy++) {
+    \\        for (int dx = -1; dx <= 1; dx++) {
+    \\            if (dx == 0 && dy == 0) continue;
+    \\
+    \\            ivec2 samplePixel = pixel + ivec2(dx, dy);
+    \\            samplePixel = clamp(samplePixel, ivec2(0), ivec2(u_width - 1, u_height - 1));
+    \\
+    \\            vec4 sampleAccum = imageLoad(accumImage, samplePixel);
+    \\            vec3 sampleColor = sampleAccum.rgb / max(sampleAccum.a, 1.0);
+    \\            float sampleLum = dot(sampleColor, vec3(0.299, 0.587, 0.114));
+    \\
+    \\            // Spatial weight (Gaussian)
+    \\            float spatialDist = length(vec2(dx, dy));
+    \\            float spatialWeight = exp(-spatialDist * spatialDist / (2.0 * sigmaSpatial * sigmaSpatial));
+    \\
+    \\            // Range weight (edge-preserving)
+    \\            float lumDiff = abs(centerLum - sampleLum);
+    \\            float rangeWeight = exp(-lumDiff * lumDiff / (2.0 * sigmaRange * sigmaRange));
+    \\
+    \\            float weight = spatialWeight * rangeWeight * adaptiveStrength;
+    \\            sum += sampleColor * weight;
+    \\            weightSum += weight;
+    \\        }
+    \\    }
+    \\
+    \\    return sum / weightSum;
+    \\}
+    \\
+    \\// Variance-based adaptive filtering for very noisy regions
+    \\vec3 varianceGuidedDenoise(ivec2 pixel, vec3 baseResult, float sampleCount) {
+    \\    if (u_denoise <= 0.0 || sampleCount > 64.0) return baseResult;
+    \\
+    \\    // Calculate local variance in 3x3 neighborhood
+    \\    vec3 mean = vec3(0.0);
+    \\    vec3 meanSq = vec3(0.0);
+    \\    float count = 0.0;
+    \\
+    \\    for (int dy = -1; dy <= 1; dy++) {
+    \\        for (int dx = -1; dx <= 1; dx++) {
+    \\            ivec2 samplePixel = pixel + ivec2(dx, dy);
+    \\            samplePixel = clamp(samplePixel, ivec2(0), ivec2(u_width - 1, u_height - 1));
+    \\
+    \\            vec4 sampleAccum = imageLoad(accumImage, samplePixel);
+    \\            vec3 c = sampleAccum.rgb / max(sampleAccum.a, 1.0);
+    \\            mean += c;
+    \\            meanSq += c * c;
+    \\            count += 1.0;
+    \\        }
+    \\    }
+    \\
+    \\    mean /= count;
+    \\    vec3 variance = meanSq / count - mean * mean;
+    \\    float totalVariance = dot(variance, vec3(1.0));
+    \\
+    \\    // Higher variance = more denoising needed
+    \\    float varianceStrength = clamp(totalVariance * 10.0, 0.0, 1.0) * u_denoise;
+    \\
+    \\    // Blend towards local mean in high-variance areas
+    \\    return mix(baseResult, mean, varianceStrength * 0.3);
+    \\}
+    \\
     \\vec3 trace(vec3 ro, vec3 rd) {
     \\    vec3 color = vec3(1.0);
     \\    vec3 light = vec3(0.0);
@@ -1101,6 +1185,12 @@ const compute_shader_source: [*:0]const u8 =
     \\
     \\    // Post-processing pipeline
     \\    vec3 result = accum.rgb / accum.a;
+    \\
+    \\    // Temporal/spatial denoising - adaptive based on sample count
+    \\    if (u_denoise > 0.0) {
+    \\        result = spatialDenoise(pixel, result, accum.a);
+    \\        result = varianceGuidedDenoise(pixel, result, accum.a);
+    \\    }
     \\
     \\    // Chromatic aberration - sample at offset positions for each channel
     \\    vec2 center = vec2(u_width, u_height) * 0.5;
@@ -2011,6 +2101,7 @@ pub fn main() !void {
     const u_exposure_loc = glGetUniformLocation(compute_program, "u_exposure");
     const u_vignette_loc = glGetUniformLocation(compute_program, "u_vignette");
     const u_normal_strength_loc = glGetUniformLocation(compute_program, "u_normal_strength");
+    const u_denoise_loc = glGetUniformLocation(compute_program, "u_denoise");
 
     g_camera_yaw = std.math.atan2(@as(f32, -3.0), @as(f32, -13.0));
 
@@ -2177,6 +2268,15 @@ pub fn main() !void {
             }
             camera_moved = true; g_keys['M'] = false;
         }
+        // O - Denoising strength (hold Shift for decrease)
+        if (g_keys['O']) {
+            if (g_keys[0x10]) {
+                g_denoise_strength = @max(0.0, g_denoise_strength - 0.1);
+            } else {
+                g_denoise_strength = @min(2.0, g_denoise_strength + 0.1);
+            }
+            camera_moved = true; g_keys['O'] = false;
+        }
 
         // Reset accumulation when camera moves
         if (camera_moved) {
@@ -2211,6 +2311,7 @@ pub fn main() !void {
         glUniform1f(u_exposure_loc, g_exposure);
         glUniform1f(u_vignette_loc, g_vignette_strength);
         glUniform1f(u_normal_strength_loc, g_normal_strength);
+        glUniform1f(u_denoise_loc, g_denoise_strength);
 
         const groups_x = (RENDER_WIDTH + 15) / 16;
         const groups_y = (RENDER_HEIGHT + 15) / 16;
