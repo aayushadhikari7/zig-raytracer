@@ -163,6 +163,8 @@ var g_fog_density: f32 = 0.0; // Volumetric fog density (0 = off)
 var g_fog_color: [3]f32 = .{ 0.8, 0.85, 0.95 }; // Fog color (blueish)
 var g_film_grain: f32 = 0.0; // Film grain strength (0 = off)
 var g_bokeh_shape: i32 = 0; // 0=circle, 1=hexagon, 2=star, 3=heart
+var g_dispersion: f32 = 0.0; // Glass dispersion strength (0 = off, chromatic aberration in glass)
+var g_lens_flare: f32 = 0.0; // Lens flare strength (0 = off)
 
 fn windowProc(hwnd: win32.HWND, msg: c_uint, wparam: win32.WPARAM, lparam: win32.LPARAM) callconv(std.builtin.CallingConvention.c) win32.LRESULT {
     switch (msg) {
@@ -359,6 +361,8 @@ const compute_shader_source: [*:0]const u8 =
     \\uniform float u_fog_density;
     \\uniform vec3 u_fog_color;
     \\uniform float u_film_grain;
+    \\uniform float u_dispersion;  // Glass dispersion strength
+    \\uniform float u_lens_flare;  // Lens flare strength
     \\
     \\#define MAX_DEPTH 16
     \\#define BVH_STACK_SIZE 64
@@ -1743,13 +1747,45 @@ const compute_shader_source: [*:0]const u8 =
     \\                ro = rec.point + rec.normal * 0.001;
     \\                color *= weight;
     \\            }
-    \\            // Dielectric (glass)
+    \\            // Dielectric (glass) with dispersion
     \\            else if (mat_type == 2) {
-    \\                float ri = rec.front_face ? (1.0 / ior) : ior;
     \\                vec3 unit_dir = normalize(rd);
     \\                float cos_theta = min(dot(-unit_dir, rec.normal), 1.0);
     \\                float sin_theta = sqrt(1.0 - cos_theta * cos_theta);
+    \\
+    \\                // Dispersion: different IOR for each wavelength (Cauchy's equation approximation)
+    \\                // Red has lower IOR, blue has higher IOR
+    \\                float dispersion_amount = u_dispersion * 0.05;
+    \\                vec3 ior_rgb = vec3(
+    \\                    ior - dispersion_amount,  // Red (longer wavelength)
+    \\                    ior,                       // Green (reference)
+    \\                    ior + dispersion_amount   // Blue (shorter wavelength)
+    \\                );
+    \\
+    \\                // Pick wavelength based on random selection for spectral rendering
+    \\                float wavelength_choice = rand();
+    \\                float selected_ior;
+    \\                vec3 wavelength_color;
+    \\                if (u_dispersion > 0.01 && !rec.front_face) {
+    \\                    // Only apply dispersion on exit from glass (internal dispersion)
+    \\                    if (wavelength_choice < 0.333) {
+    \\                        selected_ior = ior_rgb.r;
+    \\                        wavelength_color = vec3(1.5, 0.3, 0.3); // Emphasize red
+    \\                    } else if (wavelength_choice < 0.666) {
+    \\                        selected_ior = ior_rgb.g;
+    \\                        wavelength_color = vec3(0.3, 1.5, 0.3); // Emphasize green
+    \\                    } else {
+    \\                        selected_ior = ior_rgb.b;
+    \\                        wavelength_color = vec3(0.3, 0.3, 1.5); // Emphasize blue
+    \\                    }
+    \\                    color *= wavelength_color;
+    \\                } else {
+    \\                    selected_ior = ior;
+    \\                }
+    \\
+    \\                float ri = rec.front_face ? (1.0 / selected_ior) : selected_ior;
     \\                bool cannot_refract = ri * sin_theta > 1.0;
+    \\
     \\                if (cannot_refract || reflectance(cos_theta, ri) > rand()) {
     \\                    rd = reflect(unit_dir, rec.normal);
     \\                    ro = rec.point + rec.normal * 0.001;
@@ -1931,6 +1967,55 @@ const compute_shader_source: [*:0]const u8 =
     \\    float luminance = dot(result, vec3(0.299, 0.587, 0.114));
     \\    float bloom = max(0.0, luminance - 1.0) * u_bloom;
     \\    result += bloom * vec3(1.0, 0.9, 0.8);
+    \\
+    \\    // Lens flare effect - anamorphic streaks and ghosts
+    \\    if (u_lens_flare > 0.0) {
+    \\        vec2 uv = vec2(pixel) / vec2(u_width, u_height);
+    \\        vec2 center = vec2(0.5);
+    \\        vec3 flare = vec3(0.0);
+    \\
+    \\        // Sample multiple points looking for bright areas
+    \\        const int FLARE_SAMPLES = 8;
+    \\        for (int i = 0; i < FLARE_SAMPLES; i++) {
+    \\            float angle = float(i) * 3.14159265 * 2.0 / float(FLARE_SAMPLES);
+    \\            for (float dist = 0.1; dist < 0.5; dist += 0.1) {
+    \\                vec2 sampleUV = center + vec2(cos(angle), sin(angle)) * dist;
+    \\                ivec2 samplePixel = ivec2(sampleUV * vec2(u_width, u_height));
+    \\                samplePixel = clamp(samplePixel, ivec2(0), ivec2(u_width - 1, u_height - 1));
+    \\                vec4 sampleVal = imageLoad(accumImage, samplePixel);
+    \\                vec3 sampleColor = sampleVal.rgb / max(sampleVal.a, 1.0);
+    \\                float sampleLum = dot(sampleColor, vec3(0.299, 0.587, 0.114));
+    \\
+    \\                // Only process very bright samples (lights/emissives)
+    \\                if (sampleLum > 2.0) {
+    \\                    // Ghost: mirror across center
+    \\                    vec2 ghostUV = center + (center - sampleUV) * 0.7;
+    \\                    vec2 ghostDir = normalize(uv - ghostUV);
+    \\                    float ghostDist = length(uv - ghostUV);
+    \\                    float ghostIntensity = max(0.0, 1.0 - ghostDist * 4.0) * (sampleLum - 2.0) * 0.1;
+    \\                    vec3 ghostColor = sampleColor * vec3(0.8, 0.9, 1.0); // Slightly blue tint
+    \\                    flare += ghostColor * ghostIntensity;
+    \\
+    \\                    // Anamorphic horizontal streak
+    \\                    vec2 lightScreenPos = sampleUV;
+    \\                    float streakDist = abs(uv.y - lightScreenPos.y);
+    \\                    float streakFalloff = exp(-streakDist * 20.0);
+    \\                    float streakIntensity = streakFalloff * (sampleLum - 2.0) * 0.05;
+    \\                    vec3 streakColor = sampleColor * vec3(1.0, 0.8, 0.6); // Warm streak
+    \\                    flare += streakColor * streakIntensity;
+    \\
+    \\                    // Starburst pattern around light
+    \\                    vec2 toLight = uv - lightScreenPos;
+    \\                    float lightAngle = atan(toLight.y, toLight.x);
+    \\                    float starPattern = abs(sin(lightAngle * 6.0)); // 6-pointed star
+    \\                    float starDist = length(toLight);
+    \\                    float starIntensity = starPattern * exp(-starDist * 8.0) * (sampleLum - 2.0) * 0.03;
+    \\                    flare += sampleColor * starIntensity;
+    \\                }
+    \\            }
+    \\        }
+    \\        result += flare * u_lens_flare;
+    \\    }
     \\
     \\    // Exposure adjustment
     \\    result *= u_exposure;
@@ -2125,8 +2210,8 @@ pub fn main() !void {
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 3, bvh_ssbo);
 
     // Load triangle meshes - try OBJ files first, fallback to procedural
-    var triangles = std.ArrayList(GPUTriangle).init(allocator);
-    defer triangles.deinit();
+    var triangles = std.ArrayList(GPUTriangle){};
+    defer triangles.deinit(allocator);
 
     // Try loading OBJ files from models folder
     // Model 1: Golden torus (center)
@@ -2136,8 +2221,8 @@ pub fn main() !void {
         .albedo = .{ 1.0, 0.84, 0.0 }, // Gold
         .mat_type = 1, // Metal
     })) |mesh| {
-        defer @constCast(&mesh).deinit();
-        try triangles.appendSlice(mesh.triangles.items);
+        defer @constCast(&mesh).deinit(allocator);
+        try triangles.appendSlice(allocator, mesh.triangles.items);
         std.debug.print("Loaded torus.obj\n", .{});
     } else |_| {}
 
@@ -2148,8 +2233,8 @@ pub fn main() !void {
         .albedo = .{ 0.95, 0.95, 1.0 }, // Slight blue tint
         .mat_type = 2, // Glass
     })) |mesh| {
-        defer @constCast(&mesh).deinit();
-        try triangles.appendSlice(mesh.triangles.items);
+        defer @constCast(&mesh).deinit(allocator);
+        try triangles.appendSlice(allocator, mesh.triangles.items);
         std.debug.print("Loaded diamond.obj\n", .{});
     } else |_| {}
 
@@ -2161,8 +2246,8 @@ pub fn main() !void {
         .mat_type = 0, // Diffuse
         .texture_id = 2, // Brick texture
     })) |mesh| {
-        defer @constCast(&mesh).deinit();
-        try triangles.appendSlice(mesh.triangles.items);
+        defer @constCast(&mesh).deinit(allocator);
+        try triangles.appendSlice(allocator, mesh.triangles.items);
         std.debug.print("Loaded pyramid.obj\n", .{});
     } else |_| {}
 
@@ -2174,8 +2259,8 @@ pub fn main() !void {
         .mat_type = 0, // Diffuse
         .texture_id = 1, // Checker texture
     })) |mesh| {
-        defer @constCast(&mesh).deinit();
-        try triangles.appendSlice(mesh.triangles.items);
+        defer @constCast(&mesh).deinit(allocator);
+        try triangles.appendSlice(allocator, mesh.triangles.items);
         std.debug.print("Loaded cube.obj\n", .{});
     } else |_| {}
 
@@ -2184,21 +2269,21 @@ pub fn main() !void {
         std.debug.print("No OBJ files found, creating procedural meshes\n", .{});
 
         // Gold icosphere (center)
-        try obj_loader.createIcosphere(&triangles, Vec3.init(0.0, 1.5, -5.0), 1.0, 2, .{
+        try obj_loader.createIcosphere(allocator, &triangles, Vec3.init(0.0, 1.5, -5.0), 1.0, 2, .{
             .albedo = .{ 1.0, 0.84, 0.0 },
             .mat_type = 1,
             .emissive = 0.0,
         });
 
         // Glass icosphere (left)
-        try obj_loader.createIcosphere(&triangles, Vec3.init(-2.5, 1.0, -4.0), 0.8, 2, .{
+        try obj_loader.createIcosphere(allocator, &triangles, Vec3.init(-2.5, 1.0, -4.0), 0.8, 2, .{
             .albedo = .{ 1.0, 1.0, 1.0 },
             .mat_type = 2,
             .emissive = 0.0,
         });
 
         // Red diffuse icosphere (right)
-        try obj_loader.createIcosphere(&triangles, Vec3.init(2.5, 1.0, -4.0), 0.8, 2, .{
+        try obj_loader.createIcosphere(allocator, &triangles, Vec3.init(2.5, 1.0, -4.0), 0.8, 2, .{
             .albedo = .{ 0.8, 0.2, 0.2 },
             .mat_type = 0,
             .emissive = 0.0,
@@ -2223,8 +2308,8 @@ pub fn main() !void {
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 4, triangle_ssbo);
 
     // Build and upload triangle BVH
-    var tri_bvh_nodes = std.ArrayList(GPUBVHNode).init(allocator);
-    defer tri_bvh_nodes.deinit();
+    var tri_bvh_nodes = std.ArrayList(GPUBVHNode){};
+    defer tri_bvh_nodes.deinit(allocator);
 
     if (triangles.items.len > 0) {
         var tri_indices = try allocator.alloc(u32, triangles.items.len);
@@ -2253,11 +2338,11 @@ pub fn main() !void {
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 5, tri_bvh_ssbo);
 
     // Create area lights for soft shadows
-    var area_lights = std.ArrayList(GPUAreaLight).init(allocator);
-    defer area_lights.deinit();
+    var area_lights = std.ArrayList(GPUAreaLight){};
+    defer area_lights.deinit(allocator);
 
     // Large overhead rectangular light (studio lighting style)
-    try area_lights.append(.{
+    try area_lights.append(allocator, .{
         .position = .{ -3.0, 8.0, -3.0 },
         .pad0 = 0,
         .u_vec = .{ 6.0, 0.0, 0.0 }, // 6 units wide
@@ -2271,7 +2356,7 @@ pub fn main() !void {
     });
 
     // Blue accent light on the left
-    try area_lights.append(.{
+    try area_lights.append(allocator, .{
         .position = .{ -10.0, 2.0, -2.0 },
         .pad0 = 0,
         .u_vec = .{ 0.0, 3.0, 0.0 }, // 3 units tall
@@ -2285,7 +2370,7 @@ pub fn main() !void {
     });
 
     // Orange rim light on the right
-    try area_lights.append(.{
+    try area_lights.append(allocator, .{
         .position = .{ 10.0, 1.0, 0.0 },
         .pad0 = 0,
         .u_vec = .{ 0.0, 2.0, 0.0 }, // 2 units tall
@@ -2318,8 +2403,8 @@ pub fn main() !void {
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 6, area_light_ssbo);
 
     // Create mesh instances (example: multiple instances of loaded meshes)
-    var instances = std.ArrayList(GPUMeshInstance).init(allocator);
-    defer instances.deinit();
+    var instances = std.ArrayList(GPUMeshInstance){};
+    defer instances.deinit(allocator);
 
     // Only create instances if we have triangles
     if (triangles.items.len > 0) {
@@ -2373,12 +2458,12 @@ pub fn main() !void {
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 8, instance_bvh_ssbo);
 
     // Create CSG primitives (binding 9)
-    var csg_primitives = std.ArrayList(types.GPUCSGPrimitive).init(allocator);
-    defer csg_primitives.deinit();
+    var csg_primitives = std.ArrayList(types.GPUCSGPrimitive){};
+    defer csg_primitives.deinit(allocator);
 
     // Create CSG objects (binding 10)
-    var csg_objects = std.ArrayList(types.GPUCSGObject).init(allocator);
-    defer csg_objects.deinit();
+    var csg_objects = std.ArrayList(types.GPUCSGObject){};
+    defer csg_objects.deinit(allocator);
 
     // Demo CSG: Sphere with box subtracted (creates rounded cutout)
     // Primitive 0: Large sphere
@@ -2547,6 +2632,8 @@ pub fn main() !void {
     const u_fog_density_loc = glGetUniformLocation(compute_program, "u_fog_density");
     const u_fog_color_loc = glGetUniformLocation(compute_program, "u_fog_color");
     const u_film_grain_loc = glGetUniformLocation(compute_program, "u_film_grain");
+    const u_dispersion_loc = glGetUniformLocation(compute_program, "u_dispersion");
+    const u_lens_flare_loc = glGetUniformLocation(compute_program, "u_lens_flare");
     const u_bokeh_shape_loc = glGetUniformLocation(compute_program, "u_bokeh_shape");
     const u_instance_bvh_root_loc = glGetUniformLocation(compute_program, "u_instance_bvh_root");
 
@@ -2756,6 +2843,24 @@ pub fn main() !void {
             g_bokeh_shape = @mod(g_bokeh_shape + 1, 4);
             camera_moved = true; g_keys['K'] = false;
         }
+        // Y - Glass dispersion (hold Shift for decrease)
+        if (g_keys['Y']) {
+            if (g_keys[0x10]) {
+                g_dispersion = @max(0.0, g_dispersion - 0.1);
+            } else {
+                g_dispersion = @min(2.0, g_dispersion + 0.1);
+            }
+            camera_moved = true; g_keys['Y'] = false;
+        }
+        // L - Lens flare (hold Shift for decrease)
+        if (g_keys['L']) {
+            if (g_keys[0x10]) {
+                g_lens_flare = @max(0.0, g_lens_flare - 0.1);
+            } else {
+                g_lens_flare = @min(2.0, g_lens_flare + 0.1);
+            }
+            camera_moved = true; g_keys['L'] = false;
+        }
 
         // Reset accumulation when camera moves
         if (camera_moved) {
@@ -2795,6 +2900,8 @@ pub fn main() !void {
         glUniform1f(u_fog_density_loc, g_fog_density);
         glUniform3f(u_fog_color_loc, g_fog_color[0], g_fog_color[1], g_fog_color[2]);
         glUniform1f(u_film_grain_loc, g_film_grain);
+        glUniform1f(u_dispersion_loc, g_dispersion);
+        glUniform1f(u_lens_flare_loc, g_lens_flare);
         glUniform1i(u_bokeh_shape_loc, g_bokeh_shape);
         glUniform1i(u_instance_bvh_root_loc, -1); // -1 = linear search, no BVH
 

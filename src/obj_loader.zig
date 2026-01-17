@@ -12,8 +12,8 @@ const GPUTriangle = types.GPUTriangle;
 pub const ObjMesh = struct {
     triangles: std.ArrayList(GPUTriangle),
 
-    pub fn deinit(self: *ObjMesh) void {
-        self.triangles.deinit();
+    pub fn deinit(self: *ObjMesh, allocator: std.mem.Allocator) void {
+        self.triangles.deinit(allocator);
     }
 };
 
@@ -28,9 +28,9 @@ pub const ObjTransform = struct {
 
 pub fn loadObj(allocator: std.mem.Allocator, path: []const u8, transform: ObjTransform) !ObjMesh {
     var mesh = ObjMesh{
-        .triangles = std.ArrayList(GPUTriangle).init(allocator),
+        .triangles = std.ArrayList(GPUTriangle){},
     };
-    errdefer mesh.deinit();
+    errdefer mesh.deinit(allocator);
 
     // Read file
     const file = std.fs.cwd().openFile(path, .{}) catch |err| {
@@ -46,13 +46,13 @@ pub fn loadObj(allocator: std.mem.Allocator, path: []const u8, transform: ObjTra
     defer allocator.free(content);
 
     // Parse vertices, normals, and texture coordinates
-    var vertices = std.ArrayList(Vec3).init(allocator);
-    defer vertices.deinit();
-    var normals = std.ArrayList(Vec3).init(allocator);
-    defer normals.deinit();
+    var vertices = std.ArrayList(Vec3){};
+    defer vertices.deinit(allocator);
+    var normals = std.ArrayList(Vec3){};
+    defer normals.deinit(allocator);
     const Vec2 = struct { u: f32, v: f32 };
-    var texcoords = std.ArrayList(Vec2).init(allocator);
-    defer texcoords.deinit();
+    var texcoords = std.ArrayList(Vec2){};
+    defer texcoords.deinit(allocator);
 
     var lines = std.mem.splitScalar(u8, content, '\n');
     while (lines.next()) |line| {
@@ -67,7 +67,7 @@ pub fn loadObj(allocator: std.mem.Allocator, path: []const u8, transform: ObjTra
             const x = std.fmt.parseFloat(f32, parts.next() orelse continue) catch continue;
             const y = std.fmt.parseFloat(f32, parts.next() orelse continue) catch continue;
             const z = std.fmt.parseFloat(f32, parts.next() orelse continue) catch continue;
-            try vertices.append(Vec3.init(
+            try vertices.append(allocator, Vec3.init(
                 x * transform.scale + transform.offset.x,
                 y * transform.scale + transform.offset.y,
                 z * transform.scale + transform.offset.z,
@@ -76,13 +76,13 @@ pub fn loadObj(allocator: std.mem.Allocator, path: []const u8, transform: ObjTra
             // Texture coordinate
             const u = std.fmt.parseFloat(f32, parts.next() orelse continue) catch continue;
             const v = std.fmt.parseFloat(f32, parts.next() orelse "0") catch 0.0;
-            try texcoords.append(.{ .u = u, .v = v });
+            try texcoords.append(allocator, .{ .u = u, .v = v });
         } else if (std.mem.eql(u8, cmd, "vn")) {
             // Vertex normal
             const x = std.fmt.parseFloat(f32, parts.next() orelse continue) catch continue;
             const y = std.fmt.parseFloat(f32, parts.next() orelse continue) catch continue;
             const z = std.fmt.parseFloat(f32, parts.next() orelse continue) catch continue;
-            try normals.append(Vec3.init(x, y, z).normalize());
+            try normals.append(allocator, Vec3.init(x, y, z).normalize());
         } else if (std.mem.eql(u8, cmd, "f")) {
             // Face - collect all vertex indices
             var face_verts: [16]usize = undefined;
@@ -159,7 +159,7 @@ pub fn loadObj(allocator: std.mem.Allocator, path: []const u8, transform: ObjTra
                     const uv1 = if (face_uvs[i]) |ti| texcoords.items[ti] else default_uv;
                     const uv2 = if (face_uvs[i + 1]) |ti| texcoords.items[ti] else default_uv;
 
-                    try mesh.triangles.append(.{
+                    try mesh.triangles.append(allocator, .{
                         .v0 = .{ v0.x, v0.y, v0.z },
                         .v1 = .{ v1.x, v1.y, v1.z },
                         .v2 = .{ v2.x, v2.y, v2.z },
@@ -199,7 +199,7 @@ pub const IcosphereMaterial = struct {
     emissive: f32,
 };
 
-pub fn createIcosphere(triangles: *std.ArrayList(GPUTriangle), center: Vec3, radius: f32, subdivisions: u32, material: IcosphereMaterial) !void {
+pub fn createIcosphere(allocator: std.mem.Allocator, triangles: *std.ArrayList(GPUTriangle), center: Vec3, radius: f32, subdivisions: u32, material: IcosphereMaterial) !void {
     // Golden ratio for icosahedron
     const phi: f32 = (1.0 + @sqrt(5.0)) / 2.0;
     const a: f32 = 1.0;
@@ -232,11 +232,11 @@ pub fn createIcosphere(triangles: *std.ArrayList(GPUTriangle), center: Vec3, rad
 
     // Generate all triangles
     for (faces) |face| {
-        try subdivideTriangle(triangles, base_verts[face[0]], base_verts[face[1]], base_verts[face[2]], subdivisions, center, radius, material);
+        try subdivideTriangle(allocator, triangles, base_verts[face[0]], base_verts[face[1]], base_verts[face[2]], subdivisions, center, radius, material);
     }
 }
 
-fn subdivideTriangle(tris: *std.ArrayList(GPUTriangle), v0: Vec3, v1: Vec3, v2: Vec3, depth: u32, c: Vec3, r: f32, mat: IcosphereMaterial) !void {
+fn subdivideTriangle(allocator: std.mem.Allocator, tris: *std.ArrayList(GPUTriangle), v0: Vec3, v1: Vec3, v2: Vec3, depth: u32, c: Vec3, r: f32, mat: IcosphereMaterial) !void {
     if (depth == 0) {
         // Add final triangle
         const p0 = c.add(v0.scale(r));
@@ -247,7 +247,7 @@ fn subdivideTriangle(tris: *std.ArrayList(GPUTriangle), v0: Vec3, v1: Vec3, v2: 
         const uv_0 = .{ 0.5 + std.math.atan2(v0.z, v0.x) / (2.0 * pi), 0.5 - std.math.asin(v0.y) / pi };
         const uv_1 = .{ 0.5 + std.math.atan2(v1.z, v1.x) / (2.0 * pi), 0.5 - std.math.asin(v1.y) / pi };
         const uv_2 = .{ 0.5 + std.math.atan2(v2.z, v2.x) / (2.0 * pi), 0.5 - std.math.asin(v2.y) / pi };
-        try tris.append(.{
+        try tris.append(allocator, .{
             .v0 = .{ p0.x, p0.y, p0.z },
             .v1 = .{ p1.x, p1.y, p1.z },
             .v2 = .{ p2.x, p2.y, p2.z },
@@ -273,9 +273,9 @@ fn subdivideTriangle(tris: *std.ArrayList(GPUTriangle), v0: Vec3, v1: Vec3, v2: 
         const m01 = v0.add(v1).scale(0.5).normalize();
         const m12 = v1.add(v2).scale(0.5).normalize();
         const m20 = v2.add(v0).scale(0.5).normalize();
-        try subdivideTriangle(tris, v0, m01, m20, depth - 1, c, r, mat);
-        try subdivideTriangle(tris, m01, v1, m12, depth - 1, c, r, mat);
-        try subdivideTriangle(tris, m20, m12, v2, depth - 1, c, r, mat);
-        try subdivideTriangle(tris, m01, m12, m20, depth - 1, c, r, mat);
+        try subdivideTriangle(allocator, tris, v0, m01, m20, depth - 1, c, r, mat);
+        try subdivideTriangle(allocator, tris, m01, v1, m12, depth - 1, c, r, mat);
+        try subdivideTriangle(allocator, tris, m20, m12, v2, depth - 1, c, r, mat);
+        try subdivideTriangle(allocator, tris, m01, m12, m20, depth - 1, c, r, mat);
     }
 }
