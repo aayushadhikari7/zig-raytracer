@@ -160,6 +160,7 @@ var g_denoise_strength: f32 = 0.5; // Denoising strength (0 = off)
 var g_fog_density: f32 = 0.0; // Volumetric fog density (0 = off)
 var g_fog_color: [3]f32 = .{ 0.8, 0.85, 0.95 }; // Fog color (blueish)
 var g_film_grain: f32 = 0.0; // Film grain strength (0 = off)
+var g_bokeh_shape: i32 = 0; // 0=circle, 1=hexagon, 2=star, 3=heart
 
 fn windowProc(hwnd: win32.HWND, msg: c_uint, wparam: win32.WPARAM, lparam: win32.LPARAM) callconv(std.builtin.CallingConvention.c) win32.LRESULT {
     switch (msg) {
@@ -474,6 +475,71 @@ const compute_shader_source: [*:0]const u8 =
     \\        if (dot(p, p) < 1.0) return p;
     \\    }
     \\    return vec3(0.0);
+    \\}
+    \\
+    \\// Bokeh shape types: 0=circle, 1=hexagon, 2=star, 3=heart
+    \\uniform int u_bokeh_shape;
+    \\
+    \\// Sample point in hexagonal aperture
+    \\vec2 sample_hexagon(float u, float v) {
+    \\    // Convert to polar and map to hexagon
+    \\    float angle = u * 6.28318530718;
+    \\    float radius = sqrt(v);
+    \\
+    \\    // Hexagon distance function
+    \\    float sector = floor(angle / 1.0471975512);
+    \\    float sectorAngle = mod(angle, 1.0471975512) - 0.5235987756;
+    \\    float hexRadius = cos(0.5235987756) / cos(sectorAngle);
+    \\
+    \\    return vec2(cos(angle), sin(angle)) * radius * min(hexRadius, 1.0);
+    \\}
+    \\
+    \\// Sample point in star-shaped aperture (5-pointed)
+    \\vec2 sample_star(float u, float v) {
+    \\    float angle = u * 6.28318530718;
+    \\    float radius = sqrt(v);
+    \\
+    \\    // Star shape modulation
+    \\    float starMod = 0.5 + 0.5 * cos(angle * 5.0);
+    \\    float starRadius = 0.5 + 0.5 * starMod;
+    \\
+    \\    return vec2(cos(angle), sin(angle)) * radius * starRadius;
+    \\}
+    \\
+    \\// Sample point in heart-shaped aperture
+    \\vec2 sample_heart(float u, float v) {
+    \\    float t = u * 6.28318530718;
+    \\    float scale = sqrt(v) * 0.5;
+    \\
+    \\    // Parametric heart curve
+    \\    float x = 16.0 * pow(sin(t), 3.0);
+    \\    float y = 13.0 * cos(t) - 5.0 * cos(2.0*t) - 2.0 * cos(3.0*t) - cos(4.0*t);
+    \\
+    \\    return vec2(x, y) * scale / 16.0;
+    \\}
+    \\
+    \\// Get point in shaped aperture based on current bokeh shape setting
+    \\vec3 sample_bokeh_aperture() {
+    \\    float u = rand();
+    \\    float v = rand();
+    \\
+    \\    vec2 p;
+    \\    if (u_bokeh_shape == 0) {
+    \\        // Circle (default)
+    \\        return random_in_unit_disk();
+    \\    } else if (u_bokeh_shape == 1) {
+    \\        // Hexagon
+    \\        p = sample_hexagon(u, v);
+    \\    } else if (u_bokeh_shape == 2) {
+    \\        // Star
+    \\        p = sample_star(u, v);
+    \\    } else if (u_bokeh_shape == 3) {
+    \\        // Heart
+    \\        p = sample_heart(u, v);
+    \\    } else {
+    \\        return random_in_unit_disk();
+    \\    }
+    \\    return vec3(p, 0.0);
     \\}
     \\
     \\// Ray-AABB intersection test
@@ -1352,7 +1418,7 @@ const compute_shader_source: [*:0]const u8 =
     \\    // Apply depth of field if aperture > 0
     \\    if (u_aperture > 0.0) {
     \\        vec3 focus_point = ro + rd * u_focus_dist;
-    \\        vec3 disk = random_in_unit_disk();
+    \\        vec3 disk = sample_bokeh_aperture();
     \\        vec3 offset = (u_camera_right * disk.x + u_camera_up * disk.y) * u_aperture;
     \\        ro = u_camera_pos + offset;
     \\        rd = normalize(focus_point - ro);
@@ -1855,6 +1921,7 @@ pub fn main() !void {
     const u_fog_density_loc = glGetUniformLocation(compute_program, "u_fog_density");
     const u_fog_color_loc = glGetUniformLocation(compute_program, "u_fog_color");
     const u_film_grain_loc = glGetUniformLocation(compute_program, "u_film_grain");
+    const u_bokeh_shape_loc = glGetUniformLocation(compute_program, "u_bokeh_shape");
 
     g_camera_yaw = std.math.atan2(@as(f32, -3.0), @as(f32, -13.0));
 
@@ -2048,6 +2115,11 @@ pub fn main() !void {
             }
             camera_moved = true; g_keys['G'] = false;
         }
+        // K - Cycle bokeh shape (circle/hexagon/star/heart)
+        if (g_keys['K']) {
+            g_bokeh_shape = @mod(g_bokeh_shape + 1, 4);
+            camera_moved = true; g_keys['K'] = false;
+        }
 
         // Reset accumulation when camera moves
         if (camera_moved) {
@@ -2086,6 +2158,7 @@ pub fn main() !void {
         glUniform1f(u_fog_density_loc, g_fog_density);
         glUniform3f(u_fog_color_loc, g_fog_color[0], g_fog_color[1], g_fog_color[2]);
         glUniform1f(u_film_grain_loc, g_film_grain);
+        glUniform1i(u_bokeh_shape_loc, g_bokeh_shape);
 
         const groups_x = (RENDER_WIDTH + 15) / 16;
         const groups_y = (RENDER_HEIGHT + 15) / 16;
