@@ -47,6 +47,23 @@ pub const GPUBVHNode = extern struct {
     right_child: i32, // sphere/triangle index if leaf
 };
 
+// Mesh instance for instanced rendering
+// Contains a 4x4 transform matrix and mesh reference
+pub const GPUMeshInstance = extern struct {
+    // Transform matrix (row-major) - 4 rows of vec4
+    transform_row0: [4]f32, // First row
+    transform_row1: [4]f32, // Second row
+    transform_row2: [4]f32, // Third row
+    transform_row3: [4]f32, // Fourth row (translation in xyz, 1 in w)
+    // Inverse transpose for normals (upper 3x3)
+    normal_row0: [3]f32,
+    mesh_start: i32, // Start index in triangle buffer
+    normal_row1: [3]f32,
+    mesh_end: i32, // End index in triangle buffer
+    normal_row2: [3]f32,
+    pad: i32,
+};
+
 // Rectangular area light for soft shadows
 pub const GPUAreaLight = extern struct {
     position: [3]f32, // Corner position
@@ -117,4 +134,134 @@ pub const AABB = struct {
             .max = Vec3.init(@max(a.max.x, b.max.x), @max(a.max.y, b.max.y), @max(a.max.z, b.max.z)),
         };
     }
+
+    // Transform AABB by a matrix (returns conservative bounds)
+    pub fn transform(self: AABB, m: [4][4]f32) AABB {
+        // Use the 8 corners approach for conservative AABB
+        var result = AABB.empty();
+        const corners = [8]Vec3{
+            Vec3.init(self.min.x, self.min.y, self.min.z),
+            Vec3.init(self.max.x, self.min.y, self.min.z),
+            Vec3.init(self.min.x, self.max.y, self.min.z),
+            Vec3.init(self.max.x, self.max.y, self.min.z),
+            Vec3.init(self.min.x, self.min.y, self.max.z),
+            Vec3.init(self.max.x, self.min.y, self.max.z),
+            Vec3.init(self.min.x, self.max.y, self.max.z),
+            Vec3.init(self.max.x, self.max.y, self.max.z),
+        };
+        for (corners) |c| {
+            const tx = m[0][0] * c.x + m[0][1] * c.y + m[0][2] * c.z + m[0][3];
+            const ty = m[1][0] * c.x + m[1][1] * c.y + m[1][2] * c.z + m[1][3];
+            const tz = m[2][0] * c.x + m[2][1] * c.y + m[2][2] * c.z + m[2][3];
+            result.min = Vec3.init(@min(result.min.x, tx), @min(result.min.y, ty), @min(result.min.z, tz));
+            result.max = Vec3.init(@max(result.max.x, tx), @max(result.max.y, ty), @max(result.max.z, tz));
+        }
+        return result;
+    }
 };
+
+// Helper to create identity matrix
+pub fn identityMatrix() [4][4]f32 {
+    return .{
+        .{ 1, 0, 0, 0 },
+        .{ 0, 1, 0, 0 },
+        .{ 0, 0, 1, 0 },
+        .{ 0, 0, 0, 1 },
+    };
+}
+
+// Create translation matrix
+pub fn translationMatrix(x: f32, y: f32, z: f32) [4][4]f32 {
+    return .{
+        .{ 1, 0, 0, x },
+        .{ 0, 1, 0, y },
+        .{ 0, 0, 1, z },
+        .{ 0, 0, 0, 1 },
+    };
+}
+
+// Create scale matrix
+pub fn scaleMatrix(sx: f32, sy: f32, sz: f32) [4][4]f32 {
+    return .{
+        .{ sx, 0, 0, 0 },
+        .{ 0, sy, 0, 0 },
+        .{ 0, 0, sz, 0 },
+        .{ 0, 0, 0, 1 },
+    };
+}
+
+// Create rotation matrix around Y axis
+pub fn rotationYMatrix(angle: f32) [4][4]f32 {
+    const c = @cos(angle);
+    const s = @sin(angle);
+    return .{
+        .{ c, 0, s, 0 },
+        .{ 0, 1, 0, 0 },
+        .{ -s, 0, c, 0 },
+        .{ 0, 0, 0, 1 },
+    };
+}
+
+// Multiply two 4x4 matrices
+pub fn multiplyMatrix(a: [4][4]f32, b: [4][4]f32) [4][4]f32 {
+    var result: [4][4]f32 = undefined;
+    for (0..4) |i| {
+        for (0..4) |j| {
+            result[i][j] = a[i][0] * b[0][j] + a[i][1] * b[1][j] + a[i][2] * b[2][j] + a[i][3] * b[3][j];
+        }
+    }
+    return result;
+}
+
+// Compute inverse transpose of upper 3x3 for normal transformation
+pub fn normalMatrix(m: [4][4]f32) [3][3]f32 {
+    // For rotation + uniform scale, normal matrix is just the upper 3x3
+    // For non-uniform scale, we need proper inverse transpose
+    const det = m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1]) -
+        m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0]) +
+        m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
+
+    if (@abs(det) < 1e-10) {
+        return .{
+            .{ 1, 0, 0 },
+            .{ 0, 1, 0 },
+            .{ 0, 0, 1 },
+        };
+    }
+
+    const inv_det = 1.0 / det;
+    return .{
+        .{
+            (m[1][1] * m[2][2] - m[1][2] * m[2][1]) * inv_det,
+            (m[0][2] * m[2][1] - m[0][1] * m[2][2]) * inv_det,
+            (m[0][1] * m[1][2] - m[0][2] * m[1][1]) * inv_det,
+        },
+        .{
+            (m[1][2] * m[2][0] - m[1][0] * m[2][2]) * inv_det,
+            (m[0][0] * m[2][2] - m[0][2] * m[2][0]) * inv_det,
+            (m[0][2] * m[1][0] - m[0][0] * m[1][2]) * inv_det,
+        },
+        .{
+            (m[1][0] * m[2][1] - m[1][1] * m[2][0]) * inv_det,
+            (m[0][1] * m[2][0] - m[0][0] * m[2][1]) * inv_det,
+            (m[0][0] * m[1][1] - m[0][1] * m[1][0]) * inv_det,
+        },
+    };
+}
+
+// Create a mesh instance from a transform matrix and mesh range
+pub fn createInstance(transform_mat: [4][4]f32, mesh_start: i32, mesh_end: i32) GPUMeshInstance {
+    const nm = normalMatrix(transform_mat);
+    return .{
+        .transform_row0 = transform_mat[0],
+        .transform_row1 = transform_mat[1],
+        .transform_row2 = transform_mat[2],
+        .transform_row3 = transform_mat[3],
+        .normal_row0 = nm[0],
+        .mesh_start = mesh_start,
+        .normal_row1 = nm[1],
+        .mesh_end = mesh_end,
+        .normal_row2 = nm[2],
+        .pad = 0,
+    };
+}

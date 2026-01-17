@@ -9,6 +9,7 @@ const GPUSphere = types.GPUSphere;
 const GPUTriangle = types.GPUTriangle;
 const GPUBVHNode = types.GPUBVHNode;
 const GPUAreaLight = types.GPUAreaLight;
+const GPUMeshInstance = types.GPUMeshInstance;
 
 const win32 = @cImport({
     @cDefine("WIN32_LEAN_AND_MEAN", "1");
@@ -444,6 +445,29 @@ const compute_shader_source: [*:0]const u8 =
     \\    AreaLight area_lights[];
     \\};
     \\
+    \\// Mesh instance for instanced rendering
+    \\struct MeshInstance {
+    \\    mat4 transform;        // Model transform matrix
+    \\    vec3 normal_row0;
+    \\    int mesh_start;        // Start index in triangle buffer
+    \\    vec3 normal_row1;
+    \\    int mesh_end;          // End index in triangle buffer
+    \\    vec3 normal_row2;
+    \\    int pad;
+    \\};
+    \\
+    \\layout(std430, binding = 7) buffer InstanceBuffer {
+    \\    int num_instances;
+    \\    int inst_pad1, inst_pad2, inst_pad3;
+    \\    MeshInstance instances[];
+    \\};
+    \\
+    \\layout(std430, binding = 8) buffer InstanceBVHBuffer {
+    \\    BVHNode instance_bvh[];
+    \\};
+    \\
+    \\uniform int u_instance_bvh_root;
+    \\
     \\uint state;
     \\
     \\uint pcg_hash(uint input) {
@@ -674,6 +698,147 @@ const compute_shader_source: [*:0]const u8 =
     \\    return hit_anything;
     \\}
     \\
+    \\// Test triangles in a specific range (for instanced meshes)
+    \\bool hit_triangles_range(vec3 ro, vec3 rd, int start_idx, int end_idx, float t_min, inout float closest, inout HitRecord rec) {
+    \\    bool hit_anything = false;
+    \\    HitRecord temp_rec;
+    \\
+    \\    for (int i = start_idx; i < end_idx && i < num_triangles; i++) {
+    \\        if (hit_triangle(ro, rd, i, t_min, closest, temp_rec)) {
+    \\            hit_anything = true;
+    \\            closest = temp_rec.t;
+    \\            rec = temp_rec;
+    \\        }
+    \\    }
+    \\    return hit_anything;
+    \\}
+    \\
+    \\// Matrix inverse for 4x4 (for ray transformation)
+    \\mat4 inverse_mat4(mat4 m) {
+    \\    float a00 = m[0][0], a01 = m[0][1], a02 = m[0][2], a03 = m[0][3];
+    \\    float a10 = m[1][0], a11 = m[1][1], a12 = m[1][2], a13 = m[1][3];
+    \\    float a20 = m[2][0], a21 = m[2][1], a22 = m[2][2], a23 = m[2][3];
+    \\    float a30 = m[3][0], a31 = m[3][1], a32 = m[3][2], a33 = m[3][3];
+    \\
+    \\    float b00 = a00 * a11 - a01 * a10;
+    \\    float b01 = a00 * a12 - a02 * a10;
+    \\    float b02 = a00 * a13 - a03 * a10;
+    \\    float b03 = a01 * a12 - a02 * a11;
+    \\    float b04 = a01 * a13 - a03 * a11;
+    \\    float b05 = a02 * a13 - a03 * a12;
+    \\    float b06 = a20 * a31 - a21 * a30;
+    \\    float b07 = a20 * a32 - a22 * a30;
+    \\    float b08 = a20 * a33 - a23 * a30;
+    \\    float b09 = a21 * a32 - a22 * a31;
+    \\    float b10 = a21 * a33 - a23 * a31;
+    \\    float b11 = a22 * a33 - a23 * a32;
+    \\
+    \\    float det = b00 * b11 - b01 * b10 + b02 * b09 + b03 * b08 - b04 * b07 + b05 * b06;
+    \\    if (abs(det) < 0.00001) return mat4(1.0);
+    \\
+    \\    float inv_det = 1.0 / det;
+    \\
+    \\    return mat4(
+    \\        (a11 * b11 - a12 * b10 + a13 * b09) * inv_det,
+    \\        (a02 * b10 - a01 * b11 - a03 * b09) * inv_det,
+    \\        (a31 * b05 - a32 * b04 + a33 * b03) * inv_det,
+    \\        (a22 * b04 - a21 * b05 - a23 * b03) * inv_det,
+    \\        (a12 * b08 - a10 * b11 - a13 * b07) * inv_det,
+    \\        (a00 * b11 - a02 * b08 + a03 * b07) * inv_det,
+    \\        (a32 * b02 - a30 * b05 - a33 * b01) * inv_det,
+    \\        (a20 * b05 - a22 * b02 + a23 * b01) * inv_det,
+    \\        (a10 * b10 - a11 * b08 + a13 * b06) * inv_det,
+    \\        (a01 * b08 - a00 * b10 - a03 * b06) * inv_det,
+    \\        (a30 * b04 - a31 * b02 + a33 * b00) * inv_det,
+    \\        (a21 * b02 - a20 * b04 - a23 * b00) * inv_det,
+    \\        (a11 * b07 - a10 * b09 - a12 * b06) * inv_det,
+    \\        (a00 * b09 - a01 * b07 + a02 * b06) * inv_det,
+    \\        (a31 * b01 - a30 * b03 - a32 * b00) * inv_det,
+    \\        (a20 * b03 - a21 * b01 + a22 * b00) * inv_det
+    \\    );
+    \\}
+    \\
+    \\// Test a mesh instance
+    \\bool hit_instance(vec3 ro, vec3 rd, int inst_idx, float t_min, inout float closest, inout HitRecord rec) {
+    \\    MeshInstance inst = instances[inst_idx];
+    \\
+    \\    // Transform ray to object space
+    \\    mat4 inv_transform = inverse_mat4(inst.transform);
+    \\    vec3 local_ro = (inv_transform * vec4(ro, 1.0)).xyz;
+    \\    vec3 local_rd = normalize((inv_transform * vec4(rd, 0.0)).xyz);
+    \\
+    \\    // Scale factor for t (due to normalization of direction)
+    \\    float rd_scale = length((inv_transform * vec4(rd, 0.0)).xyz);
+    \\    float local_closest = closest * rd_scale;
+    \\
+    \\    HitRecord local_rec;
+    \\    if (!hit_triangles_range(local_ro, local_rd, inst.mesh_start, inst.mesh_end, t_min * rd_scale, local_closest, local_rec)) {
+    \\        return false;
+    \\    }
+    \\
+    \\    // Transform hit back to world space
+    \\    closest = local_rec.t / rd_scale;
+    \\    rec = local_rec;
+    \\    rec.t = closest;
+    \\    rec.point = (inst.transform * vec4(local_rec.point, 1.0)).xyz;
+    \\
+    \\    // Transform normal using normal matrix
+    \\    mat3 normal_mat = mat3(inst.normal_row0, inst.normal_row1, inst.normal_row2);
+    \\    rec.normal = normalize(normal_mat * local_rec.normal);
+    \\    rec.front_face = dot(rd, rec.normal) < 0.0;
+    \\    if (!rec.front_face) rec.normal = -rec.normal;
+    \\
+    \\    return true;
+    \\}
+    \\
+    \\// Instance BVH traversal
+    \\bool hit_instances(vec3 ro, vec3 rd, float t_min, inout float closest, inout HitRecord rec) {
+    \\    if (num_instances == 0) return false;
+    \\
+    \\    // If no instance BVH, linear search
+    \\    if (u_instance_bvh_root < 0) {
+    \\        bool hit_anything = false;
+    \\        for (int i = 0; i < num_instances; i++) {
+    \\            if (hit_instance(ro, rd, i, t_min, closest, rec)) {
+    \\                hit_anything = true;
+    \\            }
+    \\        }
+    \\        return hit_anything;
+    \\    }
+    \\
+    \\    // BVH traversal for instances
+    \\    vec3 inv_rd = 1.0 / rd;
+    \\    int stack[BVH_STACK_SIZE];
+    \\    int stack_ptr = 0;
+    \\    stack[stack_ptr++] = u_instance_bvh_root;
+    \\
+    \\    bool hit_anything = false;
+    \\
+    \\    while (stack_ptr > 0) {
+    \\        int node_idx = stack[--stack_ptr];
+    \\        BVHNode node = instance_bvh[node_idx];
+    \\
+    \\        if (!hit_aabb(ro, inv_rd, node.aabb_min, node.aabb_max, closest)) {
+    \\            continue;
+    \\        }
+    \\
+    \\        if (node.left_child == -1) {
+    \\            // Leaf node - test instance
+    \\            if (hit_instance(ro, rd, node.right_child, t_min, closest, rec)) {
+    \\                hit_anything = true;
+    \\            }
+    \\        } else {
+    \\            // Interior node
+    \\            if (stack_ptr < BVH_STACK_SIZE - 1) {
+    \\                stack[stack_ptr++] = node.right_child;
+    \\                stack[stack_ptr++] = node.left_child;
+    \\            }
+    \\        }
+    \\    }
+    \\
+    \\    return hit_anything;
+    \\}
+    \\
     \\// BVH traversal using stack
     \\bool hit_world_bvh(vec3 ro, vec3 rd, float t_min, float t_max, out HitRecord rec) {
     \\    vec3 inv_rd = 1.0 / rd;
@@ -712,6 +877,11 @@ const compute_shader_source: [*:0]const u8 =
     \\
     \\    // Also check triangles
     \\    if (hit_triangles(ro, rd, t_min, closest, rec, closest)) {
+    \\        hit_anything = true;
+    \\    }
+    \\
+    \\    // Check mesh instances
+    \\    if (hit_instances(ro, rd, t_min, closest, rec)) {
     \\        hit_anything = true;
     \\    }
     \\
@@ -1893,6 +2063,61 @@ pub fn main() !void {
     glBufferData(GL_SHADER_STORAGE_BUFFER, @intCast(area_light_buffer_size), area_light_buffer_data.ptr, GL_DYNAMIC_DRAW);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 6, area_light_ssbo);
 
+    // Create mesh instances (example: multiple instances of loaded meshes)
+    var instances = std.ArrayList(GPUMeshInstance).init(allocator);
+    defer instances.deinit();
+
+    // Only create instances if we have triangles
+    if (triangles.items.len > 0) {
+        // For demo, create instances of ALL loaded triangles as a single mesh
+        // In a real scenario, you'd track individual mesh ranges
+        const mesh_start: i32 = 0;
+        const mesh_end: i32 = @intCast(triangles.items.len);
+
+        // Create a ring of instances around the scene
+        const num_copies: i32 = 6;
+        var i: i32 = 0;
+        while (i < num_copies) : (i += 1) {
+            const angle = @as(f32, @floatFromInt(i)) * 6.28318 / @as(f32, @floatFromInt(num_copies));
+            const radius: f32 = 12.0;
+            const x = @cos(angle) * radius;
+            const z = @sin(angle) * radius - 5.0; // Offset to match scene center
+
+            // Create transform: translate, then rotate to face center
+            const trans = types.translationMatrix(x, 0, z);
+            const rot = types.rotationYMatrix(angle + 3.14159);
+            const transform_mat = types.multiplyMatrix(trans, rot);
+
+            try instances.append(allocator, types.createInstance(transform_mat, mesh_start, mesh_end));
+        }
+    }
+
+    std.debug.print("Mesh instances: {}\n", .{instances.items.len});
+
+    // Upload instance buffer (binding 7)
+    var instance_ssbo: GLuint = 0;
+    glGenBuffers(1, &instance_ssbo);
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, instance_ssbo);
+    const instance_header_size = 16;
+    const instance_buffer_size = instance_header_size + instances.items.len * @sizeOf(GPUMeshInstance);
+    const instance_buffer_data = try allocator.alloc(u8, instance_buffer_size);
+    defer allocator.free(instance_buffer_data);
+    const num_instances: i32 = @intCast(instances.items.len);
+    @memcpy(instance_buffer_data[0..4], std.mem.asBytes(&num_instances));
+    @memset(instance_buffer_data[4..16], 0);
+    if (instances.items.len > 0) {
+        @memcpy(instance_buffer_data[instance_header_size..], std.mem.sliceAsBytes(instances.items));
+    }
+    glBufferData(GL_SHADER_STORAGE_BUFFER, @intCast(instance_buffer_size), instance_buffer_data.ptr, GL_DYNAMIC_DRAW);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 7, instance_ssbo);
+
+    // Empty instance BVH for now (binding 8) - linear search when few instances
+    var instance_bvh_ssbo: GLuint = 0;
+    glGenBuffers(1, &instance_bvh_ssbo);
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, instance_bvh_ssbo);
+    glBufferData(GL_SHADER_STORAGE_BUFFER, 16, null, GL_DYNAMIC_DRAW);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 8, instance_bvh_ssbo);
+
     const u_camera_pos_loc = glGetUniformLocation(compute_program, "u_camera_pos");
     const u_camera_forward_loc = glGetUniformLocation(compute_program, "u_camera_forward");
     const u_camera_right_loc = glGetUniformLocation(compute_program, "u_camera_right");
@@ -1922,6 +2147,7 @@ pub fn main() !void {
     const u_fog_color_loc = glGetUniformLocation(compute_program, "u_fog_color");
     const u_film_grain_loc = glGetUniformLocation(compute_program, "u_film_grain");
     const u_bokeh_shape_loc = glGetUniformLocation(compute_program, "u_bokeh_shape");
+    const u_instance_bvh_root_loc = glGetUniformLocation(compute_program, "u_instance_bvh_root");
 
     g_camera_yaw = std.math.atan2(@as(f32, -3.0), @as(f32, -13.0));
 
@@ -2159,6 +2385,7 @@ pub fn main() !void {
         glUniform3f(u_fog_color_loc, g_fog_color[0], g_fog_color[1], g_fog_color[2]);
         glUniform1f(u_film_grain_loc, g_film_grain);
         glUniform1i(u_bokeh_shape_loc, g_bokeh_shape);
+        glUniform1i(u_instance_bvh_root_loc, -1); // -1 = linear search, no BVH
 
         const groups_x = (RENDER_WIDTH + 15) / 16;
         const groups_y = (RENDER_HEIGHT + 15) / 16;
