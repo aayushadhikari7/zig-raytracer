@@ -385,6 +385,11 @@ const compute_shader_source: [*:0]const u8 =
     \\    float pad5;
     \\    vec3 albedo;
     \\    float emissive;
+    \\    vec2 uv0;
+    \\    vec2 uv1;
+    \\    vec2 uv2;
+    \\    int texture_id;
+    \\    int pad_uv;
     \\};
     \\
     \\layout(std430, binding = 4) buffer TriangleBuffer {
@@ -450,6 +455,8 @@ const compute_shader_source: [*:0]const u8 =
     \\    bool front_face;
     \\    int sphere_idx;
     \\    bool is_triangle;
+    \\    vec2 uv;
+    \\    int texture_id;
     \\};
     \\
     \\bool hit_sphere(vec3 ro, vec3 rd, int idx, float t_min, float t_max, out HitRecord rec) {
@@ -473,6 +480,10 @@ const compute_shader_source: [*:0]const u8 =
     \\    rec.normal = rec.front_face ? outward_normal : -outward_normal;
     \\    rec.sphere_idx = idx;
     \\    rec.is_triangle = false;
+    \\    // Spherical UV mapping
+    \\    vec3 p = normalize(rec.point - s.center);
+    \\    rec.uv = vec2(0.5 + atan(p.z, p.x) / (2.0 * 3.14159265), 0.5 - asin(p.y) / 3.14159265);
+    \\    rec.texture_id = 0;
     \\    return true;
     \\}
     \\
@@ -512,6 +523,9 @@ const compute_shader_source: [*:0]const u8 =
     \\    rec.normal = rec.front_face ? interpolated_normal : -interpolated_normal;
     \\    rec.sphere_idx = idx;  // Reuse for triangle index
     \\    rec.is_triangle = true;
+    \\    // Interpolate UV coordinates
+    \\    rec.uv = w * tri.uv0 + u * tri.uv1 + v * tri.uv2;
+    \\    rec.texture_id = tri.texture_id;
     \\    return true;
     \\}
     \\
@@ -760,6 +774,58 @@ const compute_shader_source: [*:0]const u8 =
     \\    return direct;
     \\}
     \\
+    \\// ============ PROCEDURAL TEXTURES ============
+    \\
+    \\// Checker pattern
+    \\vec3 tex_checker(vec2 uv, vec3 color1, vec3 color2, float scale) {
+    \\    vec2 p = floor(uv * scale);
+    \\    float c = mod(p.x + p.y, 2.0);
+    \\    return mix(color1, color2, c);
+    \\}
+    \\
+    \\// Brick pattern
+    \\vec3 tex_brick(vec2 uv, vec3 brick_color, vec3 mortar_color, float scale) {
+    \\    vec2 p = uv * scale;
+    \\    float row = floor(p.y);
+    \\    p.x += mod(row, 2.0) * 0.5;  // Offset every other row
+    \\    vec2 brick = fract(p);
+    \\    float mortar_width = 0.05;
+    \\    float is_mortar = step(brick.x, mortar_width) + step(1.0 - mortar_width, brick.x) +
+    \\                      step(brick.y, mortar_width) + step(1.0 - mortar_width, brick.y);
+    \\    return mix(brick_color, mortar_color, clamp(is_mortar, 0.0, 1.0));
+    \\}
+    \\
+    \\// Marble pattern using noise
+    \\float noise_marble(vec2 p) {
+    \\    return sin(p.x * 6.0 + 5.0 * (
+    \\        sin(p.x * 4.0) * 0.5 + sin(p.y * 4.0) * 0.3 +
+    \\        sin((p.x + p.y) * 3.0) * 0.2
+    \\    )) * 0.5 + 0.5;
+    \\}
+    \\
+    \\vec3 tex_marble(vec2 uv, vec3 color1, vec3 color2, float scale) {
+    \\    float n = noise_marble(uv * scale);
+    \\    return mix(color1, color2, n);
+    \\}
+    \\
+    \\// Wood grain pattern
+    \\vec3 tex_wood(vec2 uv, vec3 light_wood, vec3 dark_wood, float scale) {
+    \\    vec2 p = uv * scale;
+    \\    float r = length(p) * 10.0;
+    \\    float ring = sin(r + sin(p.x * 2.0) * 2.0 + sin(p.y * 1.5) * 1.5) * 0.5 + 0.5;
+    \\    return mix(light_wood, dark_wood, ring * ring);
+    \\}
+    \\
+    \\// Sample procedural texture by ID
+    \\vec3 sampleTexture(int tex_id, vec2 uv, vec3 base_color) {
+    \\    if (tex_id == 0) return base_color;  // No texture
+    \\    if (tex_id == 1) return tex_checker(uv, base_color, base_color * 0.2, 8.0);  // Checker
+    \\    if (tex_id == 2) return tex_brick(uv, vec3(0.6, 0.2, 0.15), vec3(0.8, 0.8, 0.75), 4.0);  // Brick
+    \\    if (tex_id == 3) return tex_marble(uv, vec3(0.95), vec3(0.3, 0.35, 0.4), 2.0);  // Marble
+    \\    if (tex_id == 4) return tex_wood(uv, vec3(0.6, 0.4, 0.2), vec3(0.3, 0.15, 0.05), 1.0);  // Wood
+    \\    return base_color;
+    \\}
+    \\
     \\vec3 trace(vec3 ro, vec3 rd) {
     \\    vec3 color = vec3(1.0);
     \\    vec3 light = vec3(0.0);
@@ -777,7 +843,7 @@ const compute_shader_source: [*:0]const u8 =
     \\            if (rec.is_triangle) {
     \\                Triangle tri = triangles[rec.sphere_idx];
     \\                mat_type = tri.mat_type;
-    \\                albedo = tri.albedo;
+    \\                albedo = sampleTexture(rec.texture_id, rec.uv, tri.albedo);
     \\                fuzz_or_roughness = 0.1;  // Default roughness for triangles
     \\                ior = 1.5;
     \\                emissive = tri.emissive;
@@ -1024,6 +1090,12 @@ const GPUTriangle = extern struct {
     pad5: f32,
     albedo: [3]f32,
     emissive: f32,
+    // UV coordinates for texture mapping
+    uv0: [2]f32,
+    uv1: [2]f32,
+    uv2: [2]f32,
+    texture_id: i32, // 0=none, 1=checker, 2=brick, 3=marble, 4=wood
+    pad_uv: i32,
 };
 
 const GPUBVHNode = extern struct {
@@ -1050,6 +1122,7 @@ fn loadObj(allocator: std.mem.Allocator, path: []const u8, transform: struct {
     albedo: [3]f32 = .{ 0.8, 0.8, 0.8 },
     mat_type: i32 = 0,
     emissive: f32 = 0.0,
+    texture_id: i32 = 0, // 0=none, 1=checker, 2=brick, 3=marble, 4=wood
 }) !ObjMesh {
     var mesh = ObjMesh{
         .triangles = std.ArrayList(GPUTriangle).init(allocator),
@@ -1069,11 +1142,15 @@ fn loadObj(allocator: std.mem.Allocator, path: []const u8, transform: struct {
     };
     defer allocator.free(content);
 
-    // Parse vertices and normals
+    // Parse vertices, normals, and texture coordinates
     var vertices = std.ArrayList(Vec3).init(allocator);
     defer vertices.deinit();
     var normals = std.ArrayList(Vec3).init(allocator);
     defer normals.deinit();
+    // UV coords stored as Vec3 (z unused, but reusing type)
+    const Vec2 = struct { u: f32, v: f32 };
+    var texcoords = std.ArrayList(Vec2).init(allocator);
+    defer texcoords.deinit();
 
     var lines = std.mem.splitScalar(u8, content, '\n');
     while (lines.next()) |line| {
@@ -1093,6 +1170,11 @@ fn loadObj(allocator: std.mem.Allocator, path: []const u8, transform: struct {
                 y * transform.scale + transform.offset.y,
                 z * transform.scale + transform.offset.z,
             ));
+        } else if (std.mem.eql(u8, cmd, "vt")) {
+            // Texture coordinate
+            const u = std.fmt.parseFloat(f32, parts.next() orelse continue) catch continue;
+            const v = std.fmt.parseFloat(f32, parts.next() orelse "0") catch 0.0;
+            try texcoords.append(.{ .u = u, .v = v });
         } else if (std.mem.eql(u8, cmd, "vn")) {
             // Vertex normal
             const x = std.fmt.parseFloat(f32, parts.next() orelse continue) catch continue;
@@ -1103,6 +1185,7 @@ fn loadObj(allocator: std.mem.Allocator, path: []const u8, transform: struct {
             // Face - collect all vertex indices
             var face_verts: [16]usize = undefined;
             var face_norms: [16]?usize = undefined;
+            var face_uvs: [16]?usize = undefined;
             var face_count: usize = 0;
 
             while (parts.next()) |face_part| {
@@ -1116,8 +1199,21 @@ fn loadObj(allocator: std.mem.Allocator, path: []const u8, transform: struct {
                 if (v_idx == 0 or v_idx > vertices.items.len) continue;
                 face_verts[face_count] = v_idx - 1;
 
-                // Skip texture coord
-                _ = indices.next();
+                // Texture coordinate index (optional)
+                if (indices.next()) |vt_str| {
+                    if (vt_str.len > 0) {
+                        const vt_idx = std.fmt.parseInt(usize, vt_str, 10) catch 0;
+                        if (vt_idx > 0 and vt_idx <= texcoords.items.len) {
+                            face_uvs[face_count] = vt_idx - 1;
+                        } else {
+                            face_uvs[face_count] = null;
+                        }
+                    } else {
+                        face_uvs[face_count] = null;
+                    }
+                } else {
+                    face_uvs[face_count] = null;
+                }
 
                 // Normal index (optional)
                 if (indices.next()) |n_str| {
@@ -1155,6 +1251,12 @@ fn loadObj(allocator: std.mem.Allocator, path: []const u8, transform: struct {
                     const n1 = if (face_norms[i]) |ni| normals.items[ni] else face_normal;
                     const n2 = if (face_norms[i + 1]) |ni| normals.items[ni] else face_normal;
 
+                    // Get UV coords (default to position-based if not provided)
+                    const default_uv = Vec2{ .u = 0.5, .v = 0.5 };
+                    const uv0 = if (face_uvs[0]) |ti| texcoords.items[ti] else default_uv;
+                    const uv1 = if (face_uvs[i]) |ti| texcoords.items[ti] else default_uv;
+                    const uv2 = if (face_uvs[i + 1]) |ti| texcoords.items[ti] else default_uv;
+
                     try mesh.triangles.append(.{
                         .v0 = .{ v0.x, v0.y, v0.z },
                         .v1 = .{ v1.x, v1.y, v1.z },
@@ -1170,13 +1272,18 @@ fn loadObj(allocator: std.mem.Allocator, path: []const u8, transform: struct {
                         .pad3 = 0,
                         .pad4 = 0,
                         .pad5 = 0,
+                        .uv0 = .{ uv0.u, uv0.v },
+                        .uv1 = .{ uv1.u, uv1.v },
+                        .uv2 = .{ uv2.u, uv2.v },
+                        .texture_id = transform.texture_id,
+                        .pad_uv = 0,
                     });
                 }
             }
         }
     }
 
-    std.debug.print("Loaded OBJ '{s}': {} vertices, {} normals, {} triangles\n", .{ path, vertices.items.len, normals.items.len, mesh.triangles.items.len });
+    std.debug.print("Loaded OBJ '{s}': {} vertices, {} normals, {} texcoords, {} triangles\n", .{ path, vertices.items.len, normals.items.len, texcoords.items.len, mesh.triangles.items.len });
     return mesh;
 }
 
@@ -1227,6 +1334,11 @@ fn createIcosphere(triangles: *std.ArrayList(GPUTriangle), center: Vec3, radius:
                 const p0 = c.add(v0.scale(r));
                 const p1 = c.add(v1.scale(r));
                 const p2 = c.add(v2.scale(r));
+                // Generate spherical UVs from normals
+                const pi = 3.14159265;
+                const uv_0 = .{ 0.5 + std.math.atan2(v0.z, v0.x) / (2.0 * pi), 0.5 - std.math.asin(v0.y) / pi };
+                const uv_1 = .{ 0.5 + std.math.atan2(v1.z, v1.x) / (2.0 * pi), 0.5 - std.math.asin(v1.y) / pi };
+                const uv_2 = .{ 0.5 + std.math.atan2(v2.z, v2.x) / (2.0 * pi), 0.5 - std.math.asin(v2.y) / pi };
                 try tris.append(.{
                     .v0 = .{ p0.x, p0.y, p0.z },
                     .v1 = .{ p1.x, p1.y, p1.z },
@@ -1242,6 +1354,11 @@ fn createIcosphere(triangles: *std.ArrayList(GPUTriangle), center: Vec3, radius:
                     .pad3 = 0,
                     .pad4 = 0,
                     .pad5 = 0,
+                    .uv0 = uv_0,
+                    .uv1 = uv_1,
+                    .uv2 = uv_2,
+                    .texture_id = 0, // No texture by default for icospheres
+                    .pad_uv = 0,
                 });
             } else {
                 // Subdivide
@@ -1648,24 +1765,26 @@ pub fn main() !void {
         std.debug.print("Loaded diamond.obj\n", .{});
     } else |_| {}
 
-    // Model 3: Red diffuse pyramid (right)
+    // Model 3: Brick pyramid (right) - shows brick texture
     if (loadObj(allocator, "models/pyramid.obj", .{
         .scale = 0.7,
         .offset = Vec3.init(2.5, 0.7, -4.0),
-        .albedo = .{ 0.85, 0.15, 0.1 }, // Red
+        .albedo = .{ 0.85, 0.5, 0.4 }, // Brick base color
         .mat_type = 0, // Diffuse
+        .texture_id = 2, // Brick texture
     })) |mesh| {
         defer @constCast(&mesh).deinit();
         try triangles.appendSlice(mesh.triangles.items);
         std.debug.print("Loaded pyramid.obj\n", .{});
     } else |_| {}
 
-    // Model 4: Chrome cube (back)
+    // Model 4: Checker cube (back) - shows checker texture
     if (loadObj(allocator, "models/cube.obj", .{
         .scale = 1.2,
         .offset = Vec3.init(0.0, 0.6, -8.0),
-        .albedo = .{ 0.95, 0.95, 0.97 }, // Chrome
-        .mat_type = 1, // Metal
+        .albedo = .{ 0.9, 0.9, 0.95 }, // Light gray
+        .mat_type = 0, // Diffuse
+        .texture_id = 1, // Checker texture
     })) |mesh| {
         defer @constCast(&mesh).deinit();
         try triangles.appendSlice(mesh.triangles.items);

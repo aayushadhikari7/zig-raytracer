@@ -1,26 +1,36 @@
-# Simple pyramid
+# Textured Pyramid with UV coordinates
 # 5 vertices, 6 faces
 
+# Vertices
 v 0.0 1.0 0.0
 v -1.0 0.0 -1.0
 v 1.0 0.0 -1.0
 v 1.0 0.0 1.0
 v -1.0 0.0 1.0
 
+# Texture coordinates
+vt 0.5 1.0
+vt 0.0 0.0
+vt 1.0 0.0
+vt 0.0 1.0
+vt 1.0 1.0
+
+# Normals
 vn 0.0 0.4472 -0.8944
 vn 0.8944 0.4472 0.0
 vn 0.0 0.4472 0.8944
 vn -0.8944 0.4472 0.0
 vn 0.0 -1.0 0.0
 
+# Triangular faces (v/vt/vn format)
 # Front face
-f 1//1 2//1 3//1
+f 1/1/1 2/2/1 3/3/1
 # Right face
-f 1//2 3//2 4//2
+f 1/1/2 3/2/2 4/3/2
 # Back face
-f 1//3 4//3 5//3
+f 1/1/3 4/2/3 5/3/3
 # Left face
-f 1//4 5//4 2//4
+f 1/1/4 5/2/4 2/3/4
 # Bottom faces
-f 2//5 5//5 4//5
-f 2//5 4//5 3//5
+f 2/4/5 5/2/5 4/3/5
+f 2/4/5 4/3/5 3/5/5
