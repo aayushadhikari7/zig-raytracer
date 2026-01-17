@@ -165,6 +165,14 @@ var g_film_grain: f32 = 0.0; // Film grain strength (0 = off)
 var g_bokeh_shape: i32 = 0; // 0=circle, 1=hexagon, 2=star, 3=heart
 var g_dispersion: f32 = 0.0; // Glass dispersion strength (0 = off, chromatic aberration in glass)
 var g_lens_flare: f32 = 0.0; // Lens flare strength (0 = off)
+var g_iridescence: f32 = 0.0; // Thin-film iridescence strength
+var g_anisotropy: f32 = 0.0; // Anisotropic reflection strength (brushed metal)
+var g_color_temp: f32 = 0.0; // Color temperature adjustment (-1 = cool, +1 = warm)
+var g_saturation: f32 = 1.0; // Saturation multiplier
+var g_scanlines: f32 = 0.0; // CRT scanline effect strength
+var g_tilt_shift: f32 = 0.0; // Tilt-shift miniature effect
+var g_glitter: f32 = 0.0; // Glitter/sparkle material intensity
+var g_heat_haze: f32 = 0.0; // Heat haze distortion
 
 fn windowProc(hwnd: win32.HWND, msg: c_uint, wparam: win32.WPARAM, lparam: win32.LPARAM) callconv(std.builtin.CallingConvention.c) win32.LRESULT {
     switch (msg) {
@@ -363,6 +371,14 @@ const compute_shader_source: [*:0]const u8 =
     \\uniform float u_film_grain;
     \\uniform float u_dispersion;  // Glass dispersion strength
     \\uniform float u_lens_flare;  // Lens flare strength
+    \\uniform float u_iridescence; // Thin-film iridescence
+    \\uniform float u_anisotropy;  // Anisotropic reflection (brushed metal)
+    \\uniform float u_color_temp;  // Color temperature (-1 cool, +1 warm)
+    \\uniform float u_saturation;  // Saturation multiplier
+    \\uniform float u_scanlines;   // CRT scanline effect
+    \\uniform float u_tilt_shift;  // Tilt-shift miniature effect
+    \\uniform float u_glitter;     // Glitter/sparkle intensity
+    \\uniform float u_heat_haze;   // Heat haze distortion
     \\
     \\#define MAX_DEPTH 16
     \\#define BVH_STACK_SIZE 64
@@ -704,6 +720,19 @@ const compute_shader_source: [*:0]const u8 =
     \\    ));
     \\}
     \\
+    \\// HitRecord struct - must be defined before functions that use it
+    \\struct HitRecord {
+    \\    vec3 point;
+    \\    vec3 normal;
+    \\    float t;
+    \\    bool front_face;
+    \\    int sphere_idx;
+    \\    bool is_triangle;
+    \\    bool is_csg;
+    \\    vec2 uv;
+    \\    int texture_id;
+    \\};
+    \\
     \\// Ray march CSG object
     \\bool hit_csg(vec3 ro, vec3 rd, int idx, float t_min, float t_max, out HitRecord rec) {
     \\    float t = t_min;
@@ -760,18 +789,6 @@ const compute_shader_source: [*:0]const u8 =
     \\    float exit = min(min(tmax.x, tmax.y), tmax.z);
     \\    return enter <= exit && exit > 0.0 && enter < t_max;
     \\}
-    \\
-    \\struct HitRecord {
-    \\    vec3 point;
-    \\    vec3 normal;
-    \\    float t;
-    \\    bool front_face;
-    \\    int sphere_idx;
-    \\    bool is_triangle;
-    \\    bool is_csg;
-    \\    vec2 uv;
-    \\    int texture_id;
-    \\};
     \\
     \\bool hit_sphere(vec3 ro, vec3 rd, int idx, float t_min, float t_max, out HitRecord rec) {
     \\    Sphere s = spheres[idx];
@@ -1120,6 +1137,77 @@ const compute_shader_source: [*:0]const u8 =
     \\    return F0 + (1.0 - F0) * pow(clamp(1.0 - cosTheta, 0.0, 1.0), 5.0);
     \\}
     \\
+    \\// Thin-film iridescence - simulates soap bubbles, oil slicks, beetle shells
+    \\vec3 thinFilmIridescence(float cosTheta, float thickness) {
+    \\    // Approximate thin-film interference using wavelength-dependent phase shift
+    \\    float n_film = 1.33; // Refractive index of thin film (like soap)
+    \\    float d = thickness * 500.0; // Film thickness in nm (scaled)
+    \\
+    \\    // Path difference causes interference at different wavelengths
+    \\    float phase = 2.0 * n_film * d * cosTheta;
+    \\
+    \\    // RGB wavelengths approximately: R=650nm, G=550nm, B=450nm
+    \\    vec3 wavelengths = vec3(650.0, 550.0, 450.0);
+    \\    vec3 interference;
+    \\    interference.r = 0.5 + 0.5 * cos(2.0 * PI * phase / wavelengths.r);
+    \\    interference.g = 0.5 + 0.5 * cos(2.0 * PI * phase / wavelengths.g);
+    \\    interference.b = 0.5 + 0.5 * cos(2.0 * PI * phase / wavelengths.b);
+    \\
+    \\    return interference;
+    \\}
+    \\
+    \\// Anisotropic GGX for brushed metal
+    \\float AnisotropicGGX(vec3 N, vec3 H, vec3 T, vec3 B, float ax, float ay) {
+    \\    float NoH = dot(N, H);
+    \\    float ToH = dot(T, H);
+    \\    float BoH = dot(B, H);
+    \\    float d = ToH * ToH / (ax * ax) + BoH * BoH / (ay * ay) + NoH * NoH;
+    \\    return 1.0 / (PI * ax * ay * d * d);
+    \\}
+    \\
+    \\// Glitter/sparkle - randomly oriented micro-facets
+    \\float glitterSparkle(vec3 pos, vec3 V, vec3 N, float density) {
+    \\    // Create random facet orientations based on position
+    \\    vec3 cellPos = floor(pos * density);
+    \\    float cellHash = fract(sin(dot(cellPos, vec3(12.9898, 78.233, 45.164))) * 43758.5453);
+    \\
+    \\    // Random facet normal
+    \\    float theta = cellHash * 2.0 * PI;
+    \\    float phi = fract(cellHash * 7.31) * PI;
+    \\    vec3 facetN = vec3(sin(phi) * cos(theta), sin(phi) * sin(theta), cos(phi));
+    \\    facetN = normalize(mix(N, facetN, 0.3)); // Blend with surface normal
+    \\
+    \\    // Sparkle intensity based on view angle to facet
+    \\    float sparkle = pow(max(0.0, dot(reflect(-V, facetN), V)), 256.0);
+    \\
+    \\    // Only some cells sparkle
+    \\    sparkle *= step(0.9, cellHash);
+    \\
+    \\    return sparkle;
+    \\}
+    \\
+    \\// Heat haze distortion
+    \\vec2 heatHazeOffset(vec2 uv, float time, float strength) {
+    \\    float distort = sin(uv.y * 50.0 + time * 3.0) * cos(uv.x * 30.0 + time * 2.0);
+    \\    distort += sin(uv.y * 80.0 - time * 4.0) * 0.5;
+    \\    return vec2(distort, distort * 0.5) * strength * 0.01;
+    \\}
+    \\
+    \\// Color temperature adjustment (Kelvin-like)
+    \\vec3 adjustColorTemp(vec3 color, float temp) {
+    \\    // temp: -1 = cool (blue), +1 = warm (orange)
+    \\    vec3 warm = vec3(1.0, 0.9, 0.7);
+    \\    vec3 cool = vec3(0.7, 0.85, 1.0);
+    \\    vec3 tint = mix(cool, warm, temp * 0.5 + 0.5);
+    \\    return color * tint;
+    \\}
+    \\
+    \\// Saturation adjustment
+    \\vec3 adjustSaturation(vec3 color, float sat) {
+    \\    float luma = dot(color, vec3(0.299, 0.587, 0.114));
+    \\    return mix(vec3(luma), color, sat);
+    \\}
+    \\
     \\// Sample GGX distribution for importance sampling
     \\vec3 ImportanceSampleGGX(vec2 Xi, vec3 N, float roughness) {
     \\    float a = roughness * roughness;
@@ -1405,22 +1493,7 @@ const compute_shader_source: [*:0]const u8 =
     \\    return n;
     \\}
     \\
-    \\// Build TBN matrix from normal and UV derivatives
-    \\mat3 buildTBN(vec3 N, vec3 pos, vec2 uv) {
-    \\    // Compute tangent from world position (approximate)
-    \\    vec3 Q1 = dFdx(pos);
-    \\    vec3 Q2 = dFdy(pos);
-    \\    vec2 st1 = dFdx(uv);
-    \\    vec2 st2 = dFdy(uv);
-    \\
-    \\    vec3 T = normalize(Q1 * st2.y - Q2 * st1.y);
-    \\    vec3 B = normalize(cross(N, T));
-    \\    T = cross(B, N);
-    \\
-    \\    return mat3(T, B, N);
-    \\}
-    \\
-    \\// Alternative TBN for compute shader (no dFdx/dFdy)
+    \\// Build TBN matrix for compute shader (no dFdx/dFdy available)
     \\mat3 buildTBN_compute(vec3 N) {
     \\    // Create arbitrary tangent perpendicular to normal
     \\    vec3 up = abs(N.y) < 0.999 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
@@ -1715,17 +1788,52 @@ const compute_shader_source: [*:0]const u8 =
     \\                if (length(scatter_dir) < 0.0001) scatter_dir = rec.normal;
     \\                rd = normalize(scatter_dir);
     \\                ro = rec.point + rec.normal * 0.001;
-    \\                color *= albedo;
+    \\
+    \\                // Apply iridescence (thin-film interference)
+    \\                vec3 finalAlbedo = albedo;
+    \\                if (u_iridescence > 0.0) {
+    \\                    float cosTheta = max(dot(-normalize(rd), rec.normal), 0.0);
+    \\                    float thickness = fract(dot(rec.point, vec3(1.7, 2.3, 3.1))); // Vary thickness
+    \\                    vec3 irid = thinFilmIridescence(cosTheta, thickness);
+    \\                    finalAlbedo = mix(albedo, albedo * irid * 2.0, u_iridescence);
+    \\                }
+    \\
+    \\                // Add glitter sparkle
+    \\                if (u_glitter > 0.0) {
+    \\                    float sparkle = glitterSparkle(rec.point, -rd, rec.normal, 100.0);
+    \\                    light += color * sparkle * u_glitter * 5.0;
+    \\                }
+    \\
+    \\                color *= finalAlbedo;
     \\            }
-    \\            // Metal with GGX microfacet BRDF
+    \\            // Metal with GGX microfacet BRDF (with anisotropic option)
     \\            else if (mat_type == 1) {
     \\                vec3 V = -rd;
     \\                vec3 N = rec.normal;
     \\                float roughness = max(fuzz_or_roughness * u_roughness_mult, 0.04);
     \\
-    \\                // GGX importance sampling for reflection direction
+    \\                // Build tangent frame for anisotropic
+    \\                vec3 up = abs(N.z) < 0.999 ? vec3(0.0, 0.0, 1.0) : vec3(1.0, 0.0, 0.0);
+    \\                vec3 T = normalize(cross(up, N));
+    \\                vec3 B = cross(N, T);
+    \\
+    \\                // Anisotropic roughness (brushed metal effect)
+    \\                float ax = roughness;
+    \\                float ay = roughness;
+    \\                if (u_anisotropy > 0.0) {
+    \\                    float aniso = u_anisotropy * 0.9;
+    \\                    ax = max(roughness * (1.0 + aniso), 0.01);
+    \\                    ay = max(roughness * (1.0 - aniso), 0.01);
+    \\                }
+    \\
+    \\                // Anisotropic GGX importance sampling
     \\                vec2 Xi = vec2(rand(), rand());
-    \\                vec3 H = ImportanceSampleGGX(Xi, N, roughness);
+    \\                float phi = 2.0 * PI * Xi.x;
+    \\                float cosTheta = sqrt((1.0 - Xi.y) / (1.0 + (ax * ax * cos(phi) * cos(phi) + ay * ay * sin(phi) * sin(phi) - 1.0) * Xi.y));
+    \\                float sinTheta = sqrt(max(0.0, 1.0 - cosTheta * cosTheta));
+    \\
+    \\                vec3 H_local = vec3(cos(phi) * sinTheta, sin(phi) * sinTheta, cosTheta);
+    \\                vec3 H = normalize(T * H_local.x + B * H_local.y + N * H_local.z);
     \\                vec3 L = reflect(-V, H);
     \\
     \\                float NdotL = dot(N, L);
@@ -1735,13 +1843,20 @@ const compute_shader_source: [*:0]const u8 =
     \\                float NdotH = max(dot(N, H), 0.0);
     \\                float VdotH = max(dot(V, H), 0.0);
     \\
-    \\                // Cook-Torrance BRDF
+    \\                // Cook-Torrance BRDF with anisotropic NDF
     \\                vec3 F0 = albedo;  // Metal uses albedo as F0
     \\                vec3 F = FresnelSchlick(VdotH, F0);
     \\                float G = GeometrySmith(N, V, L, roughness);
+    \\                float D = (u_anisotropy > 0.0) ? AnisotropicGGX(N, H, T, B, ax, ay) : 1.0;
     \\
     \\                // Importance sampling weight
     \\                vec3 weight = F * G * VdotH / max(NdotH * NdotV, 0.001);
+    \\
+    \\                // Add iridescence to metal (like titanium, anodized aluminum)
+    \\                if (u_iridescence > 0.0) {
+    \\                    vec3 irid = thinFilmIridescence(VdotH, fract(dot(rec.point, vec3(3.1, 1.7, 2.3))));
+    \\                    weight *= mix(vec3(1.0), irid, u_iridescence * 0.5);
+    \\                }
     \\
     \\                rd = L;
     \\                ro = rec.point + rec.normal * 0.001;
@@ -2033,6 +2148,88 @@ const compute_shader_source: [*:0]const u8 =
     \\    vec2 uv_vignette = vec2(pixel) / vec2(u_width, u_height);
     \\    float vignette = 1.0 - u_vignette * length((uv_vignette - 0.5) * 1.2);
     \\    result *= vignette;
+    \\
+    \\    // Heat haze distortion
+    \\    if (u_heat_haze > 0.0) {
+    \\        vec2 uv = vec2(pixel) / vec2(u_width, u_height);
+    \\        vec2 offset = heatHazeOffset(uv, float(u_frame) * 0.05, u_heat_haze);
+    \\        ivec2 distortedPixel = ivec2((uv + offset) * vec2(u_width, u_height));
+    \\        distortedPixel = clamp(distortedPixel, ivec2(0), ivec2(u_width - 1, u_height - 1));
+    \\        vec4 distortedAccum = imageLoad(accumImage, distortedPixel);
+    \\        vec3 distortedColor = distortedAccum.rgb / max(distortedAccum.a, 1.0);
+    \\        // Apply same tonemapping to distorted sample
+    \\        distortedColor *= u_exposure;
+    \\        distortedColor = (distortedColor * (2.51 * distortedColor + 0.03)) / (distortedColor * (2.43 * distortedColor + 0.59) + 0.14);
+    \\        distortedColor = pow(clamp(distortedColor, 0.0, 1.0), vec3(1.0 / 2.2));
+    \\        result = mix(result, distortedColor, u_heat_haze * 0.5);
+    \\    }
+    \\
+    \\    // Color temperature adjustment
+    \\    if (abs(u_color_temp) > 0.01) {
+    \\        result = adjustColorTemp(result, u_color_temp);
+    \\    }
+    \\
+    \\    // Saturation adjustment
+    \\    if (abs(u_saturation - 1.0) > 0.01) {
+    \\        result = adjustSaturation(result, u_saturation);
+    \\    }
+    \\
+    \\    // Tilt-shift miniature effect (blur top and bottom)
+    \\    if (u_tilt_shift > 0.0) {
+    \\        vec2 uv = vec2(pixel) / vec2(u_width, u_height);
+    \\        float focusBand = 0.3; // Sharp band in the middle
+    \\        float distFromCenter = abs(uv.y - 0.5) * 2.0;
+    \\        float blurAmount = smoothstep(focusBand, 1.0, distFromCenter) * u_tilt_shift;
+    \\
+    \\        if (blurAmount > 0.01) {
+    \\            vec3 blurred = result;
+    \\            float blurRadius = blurAmount * 10.0;
+    \\            for (int i = -3; i <= 3; i++) {
+    \\                for (int j = -3; j <= 3; j++) {
+    \\                    if (i == 0 && j == 0) continue;
+    \\                    ivec2 samplePos = pixel + ivec2(int(float(i) * blurRadius), int(float(j) * blurRadius));
+    \\                    samplePos = clamp(samplePos, ivec2(0), ivec2(u_width - 1, u_height - 1));
+    \\                    vec4 sampleAccum = imageLoad(accumImage, samplePos);
+    \\                    vec3 sampleColor = sampleAccum.rgb / max(sampleAccum.a, 1.0);
+    \\                    sampleColor *= u_exposure;
+    \\                    sampleColor = (sampleColor * (2.51 * sampleColor + 0.03)) / (sampleColor * (2.43 * sampleColor + 0.59) + 0.14);
+    \\                    sampleColor = pow(clamp(sampleColor, 0.0, 1.0), vec3(1.0 / 2.2));
+    \\                    blurred += sampleColor;
+    \\                }
+    \\            }
+    \\            blurred /= 49.0;
+    \\            result = mix(result, blurred, blurAmount);
+    \\        }
+    \\    }
+    \\
+    \\    // CRT scanlines effect
+    \\    if (u_scanlines > 0.0) {
+    \\        float scanline = sin(float(pixel.y) * 3.14159265) * 0.5 + 0.5;
+    \\        scanline = pow(scanline, 1.5);
+    \\        result *= mix(1.0, scanline, u_scanlines * 0.3);
+    \\
+    \\        // CRT curvature at edges
+    \\        vec2 uv = vec2(pixel) / vec2(u_width, u_height);
+    \\        vec2 curved = (uv - 0.5) * 2.0;
+    \\        curved *= 1.0 + pow(length(curved), 2.0) * u_scanlines * 0.1;
+    \\        curved = curved * 0.5 + 0.5;
+    \\
+    \\        // Slight RGB separation for CRT look
+    \\        float rgbSep = u_scanlines * 0.002;
+    \\        vec2 redOffset = vec2(rgbSep, 0.0);
+    \\        vec2 blueOffset = vec2(-rgbSep, 0.0);
+    \\        ivec2 redPixel = clamp(pixel + ivec2(redOffset * vec2(u_width, u_height)), ivec2(0), ivec2(u_width - 1, u_height - 1));
+    \\        ivec2 bluePixel = clamp(pixel + ivec2(blueOffset * vec2(u_width, u_height)), ivec2(0), ivec2(u_width - 1, u_height - 1));
+    \\        vec4 redAccum = imageLoad(accumImage, redPixel);
+    \\        vec4 blueAccum = imageLoad(accumImage, bluePixel);
+    \\        vec3 redSample = redAccum.rgb / max(redAccum.a, 1.0);
+    \\        vec3 blueSample = blueAccum.rgb / max(blueAccum.a, 1.0);
+    \\        result.r = mix(result.r, redSample.r * u_exposure, u_scanlines * 0.3);
+    \\        result.b = mix(result.b, blueSample.b * u_exposure, u_scanlines * 0.3);
+    \\
+    \\        // Phosphor glow
+    \\        result += result * u_scanlines * 0.1;
+    \\    }
     \\
     \\    // Film grain effect - adds subtle analog film texture
     \\    if (u_film_grain > 0.0) {
@@ -2634,6 +2831,14 @@ pub fn main() !void {
     const u_film_grain_loc = glGetUniformLocation(compute_program, "u_film_grain");
     const u_dispersion_loc = glGetUniformLocation(compute_program, "u_dispersion");
     const u_lens_flare_loc = glGetUniformLocation(compute_program, "u_lens_flare");
+    const u_iridescence_loc = glGetUniformLocation(compute_program, "u_iridescence");
+    const u_anisotropy_loc = glGetUniformLocation(compute_program, "u_anisotropy");
+    const u_color_temp_loc = glGetUniformLocation(compute_program, "u_color_temp");
+    const u_saturation_loc = glGetUniformLocation(compute_program, "u_saturation");
+    const u_scanlines_loc = glGetUniformLocation(compute_program, "u_scanlines");
+    const u_tilt_shift_loc = glGetUniformLocation(compute_program, "u_tilt_shift");
+    const u_glitter_loc = glGetUniformLocation(compute_program, "u_glitter");
+    const u_heat_haze_loc = glGetUniformLocation(compute_program, "u_heat_haze");
     const u_bokeh_shape_loc = glGetUniformLocation(compute_program, "u_bokeh_shape");
     const u_instance_bvh_root_loc = glGetUniformLocation(compute_program, "u_instance_bvh_root");
 
@@ -2861,6 +3066,78 @@ pub fn main() !void {
             }
             camera_moved = true; g_keys['L'] = false;
         }
+        // 5 - Iridescence / thin-film interference (hold Shift for decrease)
+        if (g_keys['5']) {
+            if (g_keys[0x10]) {
+                g_iridescence = @max(0.0, g_iridescence - 0.1);
+            } else {
+                g_iridescence = @min(2.0, g_iridescence + 0.1);
+            }
+            camera_moved = true; g_keys['5'] = false;
+        }
+        // 6 - Anisotropic reflections / brushed metal (hold Shift for decrease)
+        if (g_keys['6']) {
+            if (g_keys[0x10]) {
+                g_anisotropy = @max(0.0, g_anisotropy - 0.1);
+            } else {
+                g_anisotropy = @min(1.0, g_anisotropy + 0.1);
+            }
+            camera_moved = true; g_keys['6'] = false;
+        }
+        // 7 - Color temperature (-1 cool to +1 warm)
+        if (g_keys['7']) {
+            if (g_keys[0x10]) {
+                g_color_temp = @max(-1.0, g_color_temp - 0.1);
+            } else {
+                g_color_temp = @min(1.0, g_color_temp + 0.1);
+            }
+            camera_moved = true; g_keys['7'] = false;
+        }
+        // 8 - Saturation
+        if (g_keys['8']) {
+            if (g_keys[0x10]) {
+                g_saturation = @max(0.0, g_saturation - 0.1);
+            } else {
+                g_saturation = @min(2.0, g_saturation + 0.1);
+            }
+            camera_moved = true; g_keys['8'] = false;
+        }
+        // 9 - CRT scanlines
+        if (g_keys['9']) {
+            if (g_keys[0x10]) {
+                g_scanlines = @max(0.0, g_scanlines - 0.1);
+            } else {
+                g_scanlines = @min(1.0, g_scanlines + 0.1);
+            }
+            camera_moved = true; g_keys['9'] = false;
+        }
+        // 0 - Tilt-shift miniature effect
+        if (g_keys['0']) {
+            if (g_keys[0x10]) {
+                g_tilt_shift = @max(0.0, g_tilt_shift - 0.1);
+            } else {
+                g_tilt_shift = @min(1.0, g_tilt_shift + 0.1);
+            }
+            camera_moved = true; g_keys['0'] = false;
+        }
+        // Z - Glitter/sparkle intensity
+        if (g_keys['Z']) {
+            if (g_keys[0x10]) {
+                g_glitter = @max(0.0, g_glitter - 0.1);
+            } else {
+                g_glitter = @min(1.0, g_glitter + 0.1);
+            }
+            camera_moved = true; g_keys['Z'] = false;
+        }
+        // X - Heat haze distortion
+        if (g_keys['X']) {
+            if (g_keys[0x10]) {
+                g_heat_haze = @max(0.0, g_heat_haze - 0.05);
+            } else {
+                g_heat_haze = @min(0.5, g_heat_haze + 0.05);
+            }
+            camera_moved = true; g_keys['X'] = false;
+        }
 
         // Reset accumulation when camera moves
         if (camera_moved) {
@@ -2902,6 +3179,14 @@ pub fn main() !void {
         glUniform1f(u_film_grain_loc, g_film_grain);
         glUniform1f(u_dispersion_loc, g_dispersion);
         glUniform1f(u_lens_flare_loc, g_lens_flare);
+        glUniform1f(u_iridescence_loc, g_iridescence);
+        glUniform1f(u_anisotropy_loc, g_anisotropy);
+        glUniform1f(u_color_temp_loc, g_color_temp);
+        glUniform1f(u_saturation_loc, g_saturation);
+        glUniform1f(u_scanlines_loc, g_scanlines);
+        glUniform1f(u_tilt_shift_loc, g_tilt_shift);
+        glUniform1f(u_glitter_loc, g_glitter);
+        glUniform1f(u_heat_haze_loc, g_heat_haze);
         glUniform1i(u_bokeh_shape_loc, g_bokeh_shape);
         glUniform1i(u_instance_bvh_root_loc, -1); // -1 = linear search, no BVH
 
