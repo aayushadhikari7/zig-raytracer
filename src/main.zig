@@ -157,6 +157,7 @@ var g_roughness_mult: f32 = 1.0;
 var g_exposure: f32 = 1.0;
 var g_vignette_strength: f32 = 0.15;
 var g_normal_strength: f32 = 1.5; // Normal map strength
+var g_displacement: f32 = 0.5; // Displacement/parallax mapping strength
 var g_denoise_strength: f32 = 0.5; // Denoising strength (0 = off)
 var g_fog_density: f32 = 0.0; // Volumetric fog density (0 = off)
 var g_fog_color: [3]f32 = .{ 0.8, 0.85, 0.95 }; // Fog color (blueish)
@@ -353,6 +354,7 @@ const compute_shader_source: [*:0]const u8 =
     \\uniform float u_exposure;
     \\uniform float u_vignette;
     \\uniform float u_normal_strength;
+    \\uniform float u_displacement;  // Displacement/parallax strength
     \\uniform float u_denoise;
     \\uniform float u_fog_density;
     \\uniform vec3 u_fog_color;
@@ -1439,6 +1441,60 @@ const compute_shader_source: [*:0]const u8 =
     \\    return normalize(TBN * tangentNormal);
     \\}
     \\
+    \\// ============ DISPLACEMENT / PARALLAX MAPPING ============
+    \\
+    \\// Parallax Occlusion Mapping - creates illusion of displaced geometry
+    \\vec2 parallaxMapping(vec2 uv, vec3 viewDir, int tex_id, float heightScale) {
+    \\    if (tex_id == 0 || heightScale <= 0.0) return uv;
+    \\
+    \\    // Number of layers for ray marching
+    \\    const float minLayers = 8.0;
+    \\    const float maxLayers = 32.0;
+    \\    float numLayers = mix(maxLayers, minLayers, abs(dot(vec3(0,0,1), viewDir)));
+    \\
+    \\    float layerDepth = 1.0 / numLayers;
+    \\    float currentLayerDepth = 0.0;
+    \\
+    \\    // Direction to shift UV coords per layer
+    \\    vec2 P = viewDir.xy * heightScale;
+    \\    vec2 deltaUV = P / numLayers;
+    \\
+    \\    vec2 currentUV = uv;
+    \\    float currentHeight = getHeight(currentUV, tex_id, 1.0);
+    \\
+    \\    // Ray march through height layers
+    \\    for (int i = 0; i < 32 && currentLayerDepth < currentHeight; i++) {
+    \\        currentUV -= deltaUV;
+    \\        currentHeight = getHeight(currentUV, tex_id, 1.0);
+    \\        currentLayerDepth += layerDepth;
+    \\    }
+    \\
+    \\    // Interpolation for smoother result
+    \\    vec2 prevUV = currentUV + deltaUV;
+    \\    float afterDepth = currentHeight - currentLayerDepth;
+    \\    float beforeDepth = getHeight(prevUV, tex_id, 1.0) - currentLayerDepth + layerDepth;
+    \\    float weight = afterDepth / (afterDepth - beforeDepth);
+    \\
+    \\    return mix(currentUV, prevUV, weight);
+    \\}
+    \\
+    \\// Apply displacement to hit record - modifies UV and recalculates position
+    \\void applyDisplacement(inout HitRecord rec, vec3 viewDir, float strength) {
+    \\    if (rec.texture_id == 0 || strength <= 0.0) return;
+    \\
+    \\    // Transform view direction to tangent space (simplified)
+    \\    mat3 TBN = buildTBN_compute(rec.normal);
+    \\    vec3 tangentViewDir = transpose(TBN) * viewDir;
+    \\
+    \\    // Apply parallax mapping
+    \\    vec2 newUV = parallaxMapping(rec.uv, tangentViewDir, rec.texture_id, strength * 0.1);
+    \\    rec.uv = newUV;
+    \\
+    \\    // Optionally offset the hit point along normal based on height
+    \\    float height = getHeight(newUV, rec.texture_id, 1.0);
+    \\    rec.point -= rec.normal * height * strength * 0.05;
+    \\}
+    \\
     \\// ============ TEMPORAL/SPATIAL DENOISING ============
     \\
     \\// Edge-aware spatial denoising using bilateral filtering
@@ -1619,6 +1675,11 @@ const compute_shader_source: [*:0]const u8 =
     \\                fuzz_or_roughness = s.fuzz;
     \\                ior = s.ior;
     \\                emissive = s.emissive;
+    \\            }
+    \\
+    \\            // Apply displacement mapping (parallax) for textured surfaces
+    \\            if (rec.texture_id > 0 && u_displacement > 0.0) {
+    \\                applyDisplacement(rec, -rd, u_displacement);
     \\            }
     \\
     \\            // Apply normal mapping for textured surfaces
@@ -2481,6 +2542,7 @@ pub fn main() !void {
     const u_exposure_loc = glGetUniformLocation(compute_program, "u_exposure");
     const u_vignette_loc = glGetUniformLocation(compute_program, "u_vignette");
     const u_normal_strength_loc = glGetUniformLocation(compute_program, "u_normal_strength");
+    const u_displacement_loc = glGetUniformLocation(compute_program, "u_displacement");
     const u_denoise_loc = glGetUniformLocation(compute_program, "u_denoise");
     const u_fog_density_loc = glGetUniformLocation(compute_program, "u_fog_density");
     const u_fog_color_loc = glGetUniformLocation(compute_program, "u_fog_color");
@@ -2653,6 +2715,15 @@ pub fn main() !void {
             }
             camera_moved = true; g_keys['M'] = false;
         }
+        // J - Displacement/parallax mapping strength (hold Shift for decrease)
+        if (g_keys['J']) {
+            if (g_keys[0x10]) {
+                g_displacement = @max(0.0, g_displacement - 0.1);
+            } else {
+                g_displacement = @min(3.0, g_displacement + 0.1);
+            }
+            camera_moved = true; g_keys['J'] = false;
+        }
         // O - Denoising strength (hold Shift for decrease)
         if (g_keys['O']) {
             if (g_keys[0x10]) {
@@ -2719,6 +2790,7 @@ pub fn main() !void {
         glUniform1f(u_exposure_loc, g_exposure);
         glUniform1f(u_vignette_loc, g_vignette_strength);
         glUniform1f(u_normal_strength_loc, g_normal_strength);
+        glUniform1f(u_displacement_loc, g_displacement);
         glUniform1f(u_denoise_loc, g_denoise_strength);
         glUniform1f(u_fog_density_loc, g_fog_density);
         glUniform3f(u_fog_color_loc, g_fog_color[0], g_fog_color[1], g_fog_color[2]);
