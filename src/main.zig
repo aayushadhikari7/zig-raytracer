@@ -657,20 +657,60 @@ const compute_shader_source: [*:0]const u8 =
     \\    return normalize(tangent * H.x + bitangent * H.y + N * H.z);
     \\}
     \\
-    \\// Beautiful HDR sky with sun
+    \\// HDR environment with physically-based atmospheric scattering
     \\vec3 getSky(vec3 rd) {
-    \\    vec3 sun_dir = normalize(vec3(0.5, 0.4, -0.6));
+    \\    // Sun parameters
+    \\    vec3 sun_dir = normalize(vec3(0.5, 0.35, -0.7));
+    \\    float sun_intensity = 20.0;  // HDR sun intensity
     \\    float sun = max(0.0, dot(rd, sun_dir));
     \\
-    \\    // Sky gradient - warm horizon, blue zenith
-    \\    float t = 0.5 * (rd.y + 1.0);
-    \\    vec3 sky = mix(vec3(0.9, 0.85, 0.8), vec3(0.4, 0.6, 1.0), pow(t, 0.5));
+    \\    // Rayleigh scattering coefficients (blue scatters more)
+    \\    vec3 rayleigh = vec3(0.0058, 0.0135, 0.0331);
     \\
-    \\    // Sun glow
-    \\    sky += vec3(1.0, 0.9, 0.7) * pow(sun, 64.0) * 2.0;
-    \\    sky += vec3(1.0, 0.7, 0.4) * pow(sun, 8.0) * 0.3;
+    \\    // View angle from horizon
+    \\    float mu = rd.y;
+    \\    float muS = sun_dir.y;
     \\
-    \\    return sky * 1.2;
+    \\    // Optical depth approximation
+    \\    float opticalDepth = exp(-max(mu, 0.0) * 4.0);
+    \\
+    \\    // Sky color with Rayleigh scattering approximation
+    \\    vec3 skyColor = vec3(0.3, 0.55, 1.0);  // Zenith blue
+    \\    vec3 horizonColor = vec3(0.85, 0.75, 0.65);  // Warm horizon
+    \\
+    \\    // Blend based on view angle
+    \\    float horizonBlend = pow(1.0 - max(mu, 0.0), 3.0);
+    \\    vec3 sky = mix(skyColor, horizonColor, horizonBlend);
+    \\
+    \\    // Add aerial perspective (atmosphere thickness)
+    \\    sky *= 1.0 + opticalDepth * 0.3;
+    \\
+    \\    // Mie scattering for sun halo (forward scattering)
+    \\    float miePhase = pow(sun, 4.0) * 0.5;
+    \\    sky += vec3(1.0, 0.95, 0.85) * miePhase * 0.4;
+    \\
+    \\    // Sun disk with HDR intensity
+    \\    float sunDisk = smoothstep(0.9997, 0.9999, sun);
+    \\    sky += vec3(1.0, 0.98, 0.9) * sunDisk * sun_intensity;
+    \\
+    \\    // Sun glow/corona
+    \\    sky += vec3(1.0, 0.9, 0.7) * pow(sun, 256.0) * 5.0;
+    \\    sky += vec3(1.0, 0.85, 0.6) * pow(sun, 32.0) * 0.5;
+    \\    sky += vec3(1.0, 0.7, 0.4) * pow(sun, 8.0) * 0.2;
+    \\
+    \\    // Subtle sunset colors near horizon when looking away from sun
+    \\    if (mu < 0.2 && mu > -0.1) {
+    \\        float sunsetFactor = (1.0 - abs(dot(normalize(vec3(rd.x, 0.0, rd.z)), normalize(vec3(sun_dir.x, 0.0, sun_dir.z))))) * 0.5;
+    \\        sky += vec3(0.4, 0.2, 0.1) * sunsetFactor * (1.0 - smoothstep(-0.1, 0.2, mu));
+    \\    }
+    \\
+    \\    // Ground plane reflection (dark ground below horizon)
+    \\    if (mu < 0.0) {
+    \\        vec3 groundColor = vec3(0.1, 0.08, 0.06);
+    \\        sky = mix(sky, groundColor, smoothstep(0.0, -0.1, mu));
+    \\    }
+    \\
+    \\    return sky;
     \\}
     \\
     \\// ========== Next Event Estimation (Direct Light Sampling) ==========
