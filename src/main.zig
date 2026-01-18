@@ -6,6 +6,16 @@ const obj_loader = @import("obj_loader.zig");
 const scene = @import("scene.zig");
 const shader_module = @import("shader.zig");
 const hud = @import("hud.zig");
+const settings = @import("settings.zig");
+const scene_io = @import("scene_io.zig");
+const image_export = @import("export.zig");
+const profiler = @import("profiler.zig");
+const shader_loader = @import("shader_loader.zig");
+const console = @import("console.zig");
+const materials = @import("materials.zig");
+const history = @import("history.zig");
+const camera_presets = @import("camera_presets.zig");
+const welcome = @import("welcome.zig");
 
 const GPUSphere = types.GPUSphere;
 const GPUTriangle = types.GPUTriangle;
@@ -28,11 +38,27 @@ const Color = vec3.Color;
 // ============================================================================
 // QUALITY SETTINGS - BVH accelerated, high quality!
 // ============================================================================
-const RENDER_WIDTH: u32 = 1920;
-const RENDER_HEIGHT: u32 = 1080;
+// Resolution will be set to native screen resolution at startup
+var g_render_width: u32 = 1920;  // Default fallback
+var g_render_height: u32 = 1080; // Default fallback
+var g_resolution_changed: bool = false;
 const WINDOW_SCALE: u32 = 1;
+// Window size (fixed at startup, used for mouse coordinate scaling)
+var g_window_width: u32 = 1920;  // Default fallback
+var g_window_height: u32 = 1080; // Default fallback
+
+// Windows constants for GetSystemMetrics
+const SM_CXSCREEN: c_int = 0;
+const SM_CYSCREEN: c_int = 1;
 const MAX_DEPTH: u32 = 4;  // Reduced for better FPS
-const SAMPLES_PER_FRAME: u32 = 2;  // Lower = better FPS
+const SAMPLES_PER_FRAME: u32 = 2;  // Restored
+
+// ============================================================================
+// DEMO CANVAS MODE - Set to false for clean canvas (like Dota 2 demo)
+// ============================================================================
+const LOAD_OBJ_MODELS: bool = false;   // Load OBJ files from models/
+const LOAD_CSG_OBJECTS: bool = false;  // Load CSG demo objects
+const LOAD_MESH_INSTANCES: bool = false; // Load mesh instances
 
 // OpenGL constants and types
 const GLuint = c_uint;
@@ -147,7 +173,7 @@ var g_camera_roll: f32 = 0.0; // Roll angle for flight mode
 var g_flight_mode: bool = false; // false = FPS camera, true = flight simulator camera
 
 // Runtime adjustable settings
-var g_fov: f32 = 20.0;
+var g_fov: f32 = 60.0;
 var g_aperture: f32 = 0.0;
 var g_focus_dist: f32 = 10.0;
 var g_samples_per_frame: u32 = 1; // Use 1-4 keys to increase for quality
@@ -200,23 +226,34 @@ var g_dither: f32 = 0.0; // Dithering effect
 var g_holographic: f32 = 0.0; // Holographic rainbow material
 var g_ascii_mode: f32 = 0.0; // ASCII art rendering
 var g_show_hud: bool = true; // TAB to toggle
+var g_dragging_slider: i32 = -1; // Which effect slider is being dragged (-1 = none)
+var g_mouse_left_down: bool = false; // Track left mouse button state
+var g_show_console: bool = false; // ~ to toggle debug console
 
 // Menu item IDs
+const IDM_FILE_NEW: c_uint = 100;
 const IDM_FILE_LOAD_OBJ: c_uint = 101;
 const IDM_FILE_SCREENSHOT: c_uint = 102;
 const IDM_FILE_EXIT: c_uint = 103;
+const IDM_FILE_SAVE_SCENE: c_uint = 104;
+const IDM_FILE_LOAD_SCENE: c_uint = 105;
+const IDM_FILE_EXPORT_PNG: c_uint = 106;
+const IDM_FILE_EXPORT_HDR: c_uint = 107;
+const IDM_FILE_EXPORT_BMP: c_uint = 108;
 const IDM_VIEW_HUD: c_uint = 201;
 const IDM_VIEW_NORMAL: c_uint = 202;
 const IDM_VIEW_HEATMAP: c_uint = 203;
 const IDM_VIEW_NORMALS: c_uint = 204;
 const IDM_VIEW_DEPTH: c_uint = 205;
 const IDM_VIEW_FLIGHT: c_uint = 206;
+const IDM_VIEW_CONSOLE: c_uint = 207;
 const IDM_SCENE_ADD_SPHERE: c_uint = 301;
 const IDM_SCENE_ADD_LIGHT: c_uint = 302;
 const IDM_SCENE_ADD_GLASS: c_uint = 303;
 const IDM_SCENE_ADD_METAL: c_uint = 304;
 const IDM_SCENE_REMOVE_LAST: c_uint = 305;
 const IDM_SCENE_RESET: c_uint = 306;
+const IDM_SCENE_ADD_SSS: c_uint = 307;
 const IDM_HELP_CONTROLS: c_uint = 401;
 const IDM_HELP_ABOUT: c_uint = 402;
 
@@ -235,8 +272,19 @@ fn createMenuBar(hwnd: win32.HWND) void {
 
     // File menu
     const hFileMenu = win32.CreatePopupMenu();
-    _ = win32.AppendMenuA(hFileMenu, MF_STRING, IDM_FILE_LOAD_OBJ, "Load OBJ...");
-    _ = win32.AppendMenuA(hFileMenu, MF_STRING, IDM_FILE_SCREENSHOT, "Save Screenshot\tF12");
+    _ = win32.AppendMenuA(hFileMenu, MF_STRING, IDM_FILE_NEW, "New Scene\tCtrl+N");
+    _ = win32.AppendMenuA(hFileMenu, MF_STRING, IDM_FILE_LOAD_SCENE, "Open Scene...\tCtrl+O");
+    _ = win32.AppendMenuA(hFileMenu, MF_STRING, IDM_FILE_SAVE_SCENE, "Save Scene...\tCtrl+S");
+    _ = win32.AppendMenuA(hFileMenu, MF_SEPARATOR, 0, null);
+    _ = win32.AppendMenuA(hFileMenu, MF_STRING, IDM_FILE_LOAD_OBJ, "Import OBJ...");
+    _ = win32.AppendMenuA(hFileMenu, MF_SEPARATOR, 0, null);
+    // Export submenu
+    const hExportMenu = win32.CreatePopupMenu();
+    _ = win32.AppendMenuA(hExportMenu, MF_STRING, IDM_FILE_EXPORT_PNG, "PNG Image...");
+    _ = win32.AppendMenuA(hExportMenu, MF_STRING, IDM_FILE_EXPORT_BMP, "BMP Image...");
+    _ = win32.AppendMenuA(hExportMenu, MF_STRING, IDM_FILE_EXPORT_HDR, "HDR Image...");
+    _ = win32.AppendMenuA(hFileMenu, MF_POPUP, @intFromPtr(hExportMenu), "Export");
+    _ = win32.AppendMenuA(hFileMenu, MF_STRING, IDM_FILE_SCREENSHOT, "Quick Screenshot\tF12");
     _ = win32.AppendMenuA(hFileMenu, MF_SEPARATOR, 0, null);
     _ = win32.AppendMenuA(hFileMenu, MF_STRING, IDM_FILE_EXIT, "Exit\tAlt+F4");
     _ = win32.AppendMenuA(hMenu, MF_POPUP, @intFromPtr(hFileMenu), "File");
@@ -244,6 +292,7 @@ fn createMenuBar(hwnd: win32.HWND) void {
     // View menu
     const hViewMenu = win32.CreatePopupMenu();
     _ = win32.AppendMenuA(hViewMenu, MF_STRING, IDM_VIEW_HUD, "Toggle HUD\tTAB");
+    _ = win32.AppendMenuA(hViewMenu, MF_STRING, IDM_VIEW_CONSOLE, "Toggle Console\t~");
     _ = win32.AppendMenuA(hViewMenu, MF_STRING, IDM_VIEW_FLIGHT, "Toggle Flight Mode\tP");
     _ = win32.AppendMenuA(hViewMenu, MF_SEPARATOR, 0, null);
     _ = win32.AppendMenuA(hViewMenu, MF_STRING, IDM_VIEW_NORMAL, "Normal View\t5");
@@ -254,18 +303,19 @@ fn createMenuBar(hwnd: win32.HWND) void {
 
     // Scene menu
     const hSceneMenu = win32.CreatePopupMenu();
-    _ = win32.AppendMenuA(hSceneMenu, MF_STRING, IDM_SCENE_ADD_SPHERE, "Add Diffuse Sphere");
-    _ = win32.AppendMenuA(hSceneMenu, MF_STRING, IDM_SCENE_ADD_METAL, "Add Metal Sphere");
-    _ = win32.AppendMenuA(hSceneMenu, MF_STRING, IDM_SCENE_ADD_GLASS, "Add Glass Sphere");
-    _ = win32.AppendMenuA(hSceneMenu, MF_STRING, IDM_SCENE_ADD_LIGHT, "Add Light");
+    _ = win32.AppendMenuA(hSceneMenu, MF_STRING, IDM_SCENE_ADD_SPHERE, "Add Diffuse Sphere\tCtrl+1");
+    _ = win32.AppendMenuA(hSceneMenu, MF_STRING, IDM_SCENE_ADD_METAL, "Add Metal Sphere\tCtrl+2");
+    _ = win32.AppendMenuA(hSceneMenu, MF_STRING, IDM_SCENE_ADD_GLASS, "Add Glass Sphere\tCtrl+3");
+    _ = win32.AppendMenuA(hSceneMenu, MF_STRING, IDM_SCENE_ADD_LIGHT, "Add Light\tCtrl+4");
+    _ = win32.AppendMenuA(hSceneMenu, MF_STRING, IDM_SCENE_ADD_SSS, "Add SSS Sphere\tCtrl+5");
     _ = win32.AppendMenuA(hSceneMenu, MF_SEPARATOR, 0, null);
-    _ = win32.AppendMenuA(hSceneMenu, MF_STRING, IDM_SCENE_REMOVE_LAST, "Remove Last Sphere");
-    _ = win32.AppendMenuA(hSceneMenu, MF_STRING, IDM_SCENE_RESET, "Reset Scene\tR");
+    _ = win32.AppendMenuA(hSceneMenu, MF_STRING, IDM_SCENE_REMOVE_LAST, "Remove Last Object\tDel");
+    _ = win32.AppendMenuA(hSceneMenu, MF_STRING, IDM_SCENE_RESET, "Reset Scene");
     _ = win32.AppendMenuA(hMenu, MF_POPUP, @intFromPtr(hSceneMenu), "Scene");
 
     // Help menu
     const hHelpMenu = win32.CreatePopupMenu();
-    _ = win32.AppendMenuA(hHelpMenu, MF_STRING, IDM_HELP_CONTROLS, "Controls...");
+    _ = win32.AppendMenuA(hHelpMenu, MF_STRING, IDM_HELP_CONTROLS, "Controls...\tF1");
     _ = win32.AppendMenuA(hHelpMenu, MF_STRING, IDM_HELP_ABOUT, "About...");
     _ = win32.AppendMenuA(hMenu, MF_POPUP, @intFromPtr(hHelpMenu), "Help");
 
@@ -283,18 +333,23 @@ fn windowProc(hwnd: win32.HWND, msg: c_uint, wparam: win32.WPARAM, lparam: win32
             const cmd: c_uint = @truncate(wparam & 0xFFFF);
             switch (cmd) {
                 IDM_FILE_EXIT => g_running = false,
+                IDM_FILE_NEW, IDM_FILE_LOAD_SCENE, IDM_FILE_SAVE_SCENE,
+                IDM_FILE_EXPORT_PNG, IDM_FILE_EXPORT_BMP, IDM_FILE_EXPORT_HDR => {
+                    g_menu_action = cmd; // Handle in main loop where we have allocator
+                },
                 IDM_FILE_SCREENSHOT => g_save_screenshot = true,
                 IDM_VIEW_HUD => g_show_hud = !g_show_hud,
+                IDM_VIEW_CONSOLE => g_show_console = !g_show_console,
                 IDM_VIEW_NORMAL => g_debug_mode = 0,
                 IDM_VIEW_HEATMAP => g_debug_mode = 1,
                 IDM_VIEW_NORMALS => g_debug_mode = 2,
                 IDM_VIEW_DEPTH => g_debug_mode = 3,
                 IDM_VIEW_FLIGHT => g_flight_mode = !g_flight_mode,
                 IDM_HELP_ABOUT => {
-                    _ = win32.MessageBoxA(hwnd, "Zig GPU Raytracer v1.0\n\nFeatures:\n- Path tracing with BVH\n- PBR materials\n- OBJ loading\n- Flight camera mode\n- 40+ post-processing effects\n\nPress TAB for controls.", "About Raytracer", 0x40);
+                    _ = win32.MessageBoxA(hwnd, "Zig GPU Raytracer v1.0\n\nA real-time path tracer built in Zig.\n\nFeatures:\n- GPU path tracing with BVH\n- 5 material types\n- 40+ post-processing effects\n- Scene save/load (JSON)\n- Image export (PNG/BMP/HDR)\n- Demo canvas mode\n\nCtrl+S: Save | Ctrl+O: Open | ~: Console", "About Raytracer", 0x40);
                 },
                 IDM_HELP_CONTROLS => {
-                    _ = win32.MessageBoxA(hwnd, "CONTROLS:\n\nWASD - Move camera\nSpace/Ctrl - Up/Down\nRight-click - Toggle mouse look\nP - Toggle flight mode\nQ/E - Roll (flight mode)\nR - Reset everything\n\n5-8 - Debug modes\n1-4 - Quality presets\nTAB - Toggle HUD\nF12 - Screenshot\n\nShift+Key - Decrease effect", "Controls", 0x40);
+                    _ = win32.MessageBoxA(hwnd, "CONTROLS:\n\nFILE:\nCtrl+N - New Scene\nCtrl+O - Open Scene\nCtrl+S - Save Scene\nF12 - Screenshot\n\nCAMERA:\nWASD - Move\nSpace/Ctrl - Up/Down\nRight-click - Mouse look\nP - Flight mode\nQ/E - Roll\n\nVIEW:\nTAB - Toggle HUD\n~ - Toggle Console\n5-8 - Debug modes\n1-4 - Quality presets\n\nSCENE:\nCtrl+1-5 - Add objects\nDel - Remove last", "Controls", 0x40);
                 },
                 else => g_menu_action = cmd, // Handle in main loop
             }
@@ -306,6 +361,151 @@ fn windowProc(hwnd: win32.HWND, msg: c_uint, wparam: win32.WPARAM, lparam: win32
         },
         win32.WM_KEYUP => {
             if (wparam < 256) g_keys[@intCast(wparam)] = false;
+            return 0;
+        },
+        win32.WM_LBUTTONDOWN => {
+            g_mouse_left_down = true;
+            // Handle HUD clicks when HUD is visible
+            if (g_show_hud and !g_show_console) {
+                // Get raw mouse coordinates in window space
+                const raw_mouse_x: i32 = @as(i16, @truncate(lparam & 0xFFFF));
+                const raw_mouse_y: i32 = @as(i16, @truncate((lparam >> 16) & 0xFFFF));
+                // Scale to render resolution (HUD is rendered at render resolution)
+                const mouse_x: i32 = @intFromFloat(@as(f32, @floatFromInt(raw_mouse_x)) * @as(f32, @floatFromInt(g_render_width)) / @as(f32, @floatFromInt(g_window_width)));
+                const mouse_y: i32 = @intFromFloat(@as(f32, @floatFromInt(raw_mouse_y)) * @as(f32, @floatFromInt(g_render_height)) / @as(f32, @floatFromInt(g_window_height)));
+                const window_width: i32 = @intCast(g_render_width);
+
+                // Tab bar: y = 8 to 36, x starts at window_width - 440, each tab is 85px wide
+                if (mouse_y >= 8 and mouse_y <= 36) {
+                    const tab_start_x = window_width - 440;
+                    if (mouse_x >= tab_start_x) {
+                        const tab_idx = @divTrunc(mouse_x - tab_start_x, 85);
+                        if (tab_idx >= 0 and tab_idx < 5) {
+                            hud.current_tab = @intCast(tab_idx);
+                        }
+                    }
+                }
+
+                // Effect sliders (only on Effects tab = 1)
+                if (hud.current_tab == 1) {
+                    // HUD: px=15, py=55, x=px+15=30, bar_x=x+115=145
+                    // First text at y=py+15=70, then +27 (lh*1.5), then +22 (lh*1.2) = ~119
+                    // Each slider row is lh*1.1 = ~20 pixels
+                    const slider_x: i32 = 145;
+                    const slider_w: i32 = 100;
+                    const first_slider_y: i32 = 119;
+                    const slider_h: i32 = 16; // Height of clickable area per slider
+                    const slider_spacing: i32 = 20;
+
+                    // Check each slider individually for precise hit detection
+                    var i: i32 = 0;
+                    while (i < 7) : (i += 1) {
+                        const sy = first_slider_y + i * slider_spacing;
+                        // Check if click is within this slider's row
+                        if (mouse_y >= sy and mouse_y <= sy + slider_h) {
+                            if (mouse_x >= slider_x and mouse_x <= slider_x + slider_w) {
+                                g_dragging_slider = i;
+                                const click_ratio = @as(f32, @floatFromInt(mouse_x - slider_x)) / @as(f32, @floatFromInt(slider_w));
+                                const maxes = [7]f32{ 1.0, 5.0, 0.02, 0.5, 2.0, 1.0, 2.0 };
+                                const new_val = click_ratio * maxes[@intCast(i)];
+
+                                switch (i) {
+                                    0 => g_bloom_strength = new_val,
+                                    1 => g_exposure = new_val,
+                                    2 => g_chromatic_strength = new_val,
+                                    3 => g_vignette_strength = new_val,
+                                    4 => g_motion_blur_strength = new_val,
+                                    5 => g_film_grain = new_val,
+                                    6 => g_denoise_strength = new_val,
+                                    else => {},
+                                }
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                // Settings tab (4) - Resolution, Quality, Debug mode buttons
+                if (hud.current_tab == 4) {
+                    const btn_start_x: i32 = 30;
+                    const btn_w: i32 = 70;
+                    const gap: i32 = 5;
+
+                    // Resolution buttons: y ~= 88
+                    const res_y: i32 = 88;
+                    if (mouse_y >= res_y and mouse_y <= res_y + 20) {
+                        var i: i32 = 0;
+                        while (i < 4) : (i += 1) {
+                            const bx = btn_start_x + i * (btn_w + gap);
+                            if (mouse_x >= bx and mouse_x <= bx + btn_w) {
+                                const widths = [4]u32{ 1280, 1920, 2560, 3840 };
+                                const heights = [4]u32{ 720, 1080, 1440, 2160 };
+                                g_render_width = widths[@intCast(i)];
+                                g_render_height = heights[@intCast(i)];
+                                g_resolution_changed = true;
+                                break;
+                            }
+                        }
+                    }
+
+                    // Quality buttons: y ~= 124
+                    const quality_y: i32 = 124;
+                    if (mouse_y >= quality_y and mouse_y <= quality_y + 20) {
+                        var i: i32 = 0;
+                        while (i < 4) : (i += 1) {
+                            const bx = btn_start_x + i * (btn_w + gap);
+                            if (mouse_x >= bx and mouse_x <= bx + btn_w) {
+                                const samples = [4]u32{ 2, 4, 8, 16 };
+                                g_samples_per_frame = samples[@intCast(i)];
+                                break;
+                            }
+                        }
+                    }
+
+                    // Debug mode buttons: y ~= 160
+                    const debug_y: i32 = 160;
+                    if (mouse_y >= debug_y and mouse_y <= debug_y + 20) {
+                        var i: i32 = 0;
+                        while (i < 4) : (i += 1) {
+                            const bx = btn_start_x + i * (btn_w + gap);
+                            if (mouse_x >= bx and mouse_x <= bx + btn_w) {
+                                g_debug_mode = i;
+                                break;
+                            }
+                        }
+                    }
+
+                    // Reset button: y ~= 268
+                    if (mouse_y >= 268 and mouse_y <= 290 and mouse_x >= 30 and mouse_x <= 130) {
+                        g_camera_pos = Vec3.init(13, 2, 3);
+                        g_camera_yaw = std.math.atan2(@as(f32, -3.0), @as(f32, -13.0));
+                        g_camera_pitch = -0.15;
+                        g_camera_roll = 0.0;
+                        g_flight_mode = false;
+                        g_debug_mode = 0;
+                        g_chromatic_strength = 0.0;
+                        g_motion_blur_strength = 0.0;
+                        g_bloom_strength = 0.0;
+                        g_exposure = 1.0;
+                        g_vignette_strength = 0.3;
+                        g_denoise_strength = 0.0;
+                        g_film_grain = 0.0;
+                        g_fov = 60.0;
+                        g_aperture = 0.0;
+                        g_focus_dist = 10.0;
+                    }
+
+                    // Screenshot button: y ~= 268
+                    if (mouse_y >= 268 and mouse_y <= 290 and mouse_x >= 140 and mouse_x <= 250) {
+                        g_save_screenshot = true;
+                    }
+                }
+            }
+            return 0;
+        },
+        win32.WM_LBUTTONUP => {
+            g_mouse_left_down = false;
+            g_dragging_slider = -1;
             return 0;
         },
         win32.WM_RBUTTONDOWN => {
@@ -324,9 +524,32 @@ fn windowProc(hwnd: win32.HWND, msg: c_uint, wparam: win32.WPARAM, lparam: win32
             return 0;
         },
         win32.WM_MOUSEMOVE => {
-            if (g_mouse_captured) {
-                const window_width: i32 = @intCast(RENDER_WIDTH * WINDOW_SCALE);
-                const window_height: i32 = @intCast(RENDER_HEIGHT * WINDOW_SCALE);
+            // Handle slider dragging
+            if (g_mouse_left_down and g_dragging_slider >= 0 and g_show_hud and hud.current_tab == 1) {
+                const raw_mouse_x: i32 = @as(i16, @truncate(lparam & 0xFFFF));
+                // Scale to render resolution
+                const mouse_x: i32 = @intFromFloat(@as(f32, @floatFromInt(raw_mouse_x)) * @as(f32, @floatFromInt(g_render_width)) / @as(f32, @floatFromInt(g_window_width)));
+                const slider_x: i32 = 145;
+                const slider_w: i32 = 100;
+                const click_x = @max(slider_x, @min(mouse_x, slider_x + slider_w));
+                const click_ratio = @as(f32, @floatFromInt(click_x - slider_x)) / @as(f32, @floatFromInt(slider_w));
+                const maxes = [7]f32{ 1.0, 5.0, 0.02, 0.5, 2.0, 1.0, 2.0 };
+                const idx: usize = @intCast(g_dragging_slider);
+                const new_val = click_ratio * maxes[idx];
+
+                switch (g_dragging_slider) {
+                    0 => g_bloom_strength = new_val,
+                    1 => g_exposure = new_val,
+                    2 => g_chromatic_strength = new_val,
+                    3 => g_vignette_strength = new_val,
+                    4 => g_motion_blur_strength = new_val,
+                    5 => g_film_grain = new_val,
+                    6 => g_denoise_strength = new_val,
+                    else => {},
+                }
+            } else if (g_mouse_captured) {
+                const window_width: i32 = @intCast(g_render_width * WINDOW_SCALE);
+                const window_height: i32 = @intCast(g_render_height * WINDOW_SCALE);
                 const cx = @divTrunc(window_width, 2);
                 const cy = @divTrunc(window_height, 2);
                 const x: i16 = @truncate(lparam & 0xFFFF);
@@ -344,8 +567,9 @@ fn windowProc(hwnd: win32.HWND, msg: c_uint, wparam: win32.WPARAM, lparam: win32
 }
 
 fn saveScreenshot(allocator: std.mem.Allocator) !void {
-    const width = RENDER_WIDTH;
-    const height = RENDER_HEIGHT;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const width = g_render_width;
+    const height = g_render_height;
     const pixel_count = width * height;
 
     // Allocate buffer for pixel data (RGB)
@@ -355,17 +579,21 @@ fn saveScreenshot(allocator: std.mem.Allocator) !void {
     // Read pixels from framebuffer
     gl.glReadPixels(0, 0, @intCast(width), @intCast(height), gl.GL_RGB, gl.GL_UNSIGNED_BYTE, pixels.ptr);
 
-    // Generate filename with timestamp
-    const timestamp = std.time.timestamp();
+    // Generate filename with timestamp (use a simple counter since std.time.timestamp is gone)
+    const S = struct {
+        var counter: u32 = 0;
+    };
+    S.counter += 1;
     var filename_buf: [64]u8 = undefined;
-    const filename = std.fmt.bufPrintZ(&filename_buf, "screenshot_{d}.bmp", .{timestamp}) catch "screenshot.bmp";
+    const filename = std.fmt.bufPrintZ(&filename_buf, "screenshot_{d}.bmp", .{S.counter}) catch "screenshot.bmp";
 
     // Create BMP file
-    const file = std.fs.cwd().createFile(filename, .{}) catch |err| {
+    const cwd = std.Io.Dir.cwd();
+    const file = cwd.createFile(io, filename, .{}) catch |err| {
         std.debug.print("Failed to create screenshot file: {}\n", .{err});
         return;
     };
-    defer file.close();
+    defer file.close(io);
 
     // BMP Header (14 bytes)
     const file_size: u32 = 54 + @as(u32, @intCast(pixel_count * 3));
@@ -394,8 +622,8 @@ fn saveScreenshot(allocator: std.mem.Allocator) !void {
         0, 0, 0, 0,                                        // Important colors
     };
 
-    file.writeAll(&bmp_header) catch return;
-    file.writeAll(&dib_header) catch return;
+    file.writeStreamingAll(io, &bmp_header) catch return;
+    file.writeStreamingAll(io, &dib_header) catch return;
 
     // Write pixel data (BMP is bottom-up, RGB -> BGR)
     var row_buf = try allocator.alloc(u8, width * 3);
@@ -411,7 +639,7 @@ fn saveScreenshot(allocator: std.mem.Allocator) !void {
             row_buf[x * 3 + 1] = src_row[x * 3 + 1]; // G
             row_buf[x * 3 + 2] = src_row[x * 3 + 0]; // R
         }
-        file.writeAll(row_buf) catch return;
+        file.writeStreamingAll(io, row_buf) catch return;
     }
 
     std.debug.print("Screenshot saved: {s}\n", .{filename});
@@ -466,6 +694,19 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
+    // Detect native screen resolution
+    const native_width = win32.GetSystemMetrics(SM_CXSCREEN);
+    const native_height = win32.GetSystemMetrics(SM_CYSCREEN);
+    if (native_width > 0 and native_height > 0) {
+        g_render_width = @intCast(native_width);
+        g_render_height = @intCast(native_height);
+        g_window_width = g_render_width;
+        g_window_height = g_render_height;
+        std.debug.print("Detected native resolution: {}x{}\n", .{ g_render_width, g_render_height });
+    } else {
+        std.debug.print("Could not detect native resolution, using fallback: {}x{}\n", .{ g_render_width, g_render_height });
+    }
+
     const hinstance = win32.GetModuleHandleA(null);
     const wc = win32.WNDCLASSEXA{
         .cbSize = @sizeOf(win32.WNDCLASSEXA),
@@ -483,8 +724,8 @@ pub fn main() !void {
     };
     _ = win32.RegisterClassExA(&wc);
 
-    const window_width: i32 = @intCast(RENDER_WIDTH * WINDOW_SCALE);
-    const window_height: i32 = @intCast(RENDER_HEIGHT * WINDOW_SCALE);
+    const window_width: i32 = @intCast(g_render_width * WINDOW_SCALE);
+    const window_height: i32 = @intCast(g_render_height * WINDOW_SCALE);
     var rect = win32.RECT{ .left = 0, .top = 0, .right = window_width, .bottom = window_height };
     _ = win32.AdjustWindowRect(&rect, win32.WS_OVERLAPPEDWINDOW, 0);
 
@@ -537,7 +778,7 @@ pub fn main() !void {
     }
     std.debug.print("OpenGL context created successfully\n", .{});
 
-    const compute_program = createComputeShader() orelse {
+    var compute_program = createComputeShader() orelse {
         std.debug.print("Failed to create compute shader\n", .{});
         return;
     };
@@ -548,12 +789,12 @@ pub fn main() !void {
     gl.glGenTextures(1, &accum_texture);
 
     gl.glBindTexture(GL_TEXTURE_2D, output_texture);
-    gl.glTexImage2D(GL_TEXTURE_2D, 0, @intCast(GL_RGBA32F), @intCast(RENDER_WIDTH), @intCast(RENDER_HEIGHT), 0, GL_RGBA, GL_FLOAT, null);
+    gl.glTexImage2D(GL_TEXTURE_2D, 0, @intCast(GL_RGBA32F), @intCast(g_render_width), @intCast(g_render_height), 0, GL_RGBA, GL_FLOAT, null);
     gl.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, @intCast(GL_LINEAR));
     gl.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, @intCast(GL_LINEAR));
 
     gl.glBindTexture(GL_TEXTURE_2D, accum_texture);
-    gl.glTexImage2D(GL_TEXTURE_2D, 0, @intCast(GL_RGBA32F), @intCast(RENDER_WIDTH), @intCast(RENDER_HEIGHT), 0, GL_RGBA, GL_FLOAT, null);
+    gl.glTexImage2D(GL_TEXTURE_2D, 0, @intCast(GL_RGBA32F), @intCast(g_render_width), @intCast(g_render_height), 0, GL_RGBA, GL_FLOAT, null);
     gl.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, @intCast(GL_LINEAR));
     gl.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, @intCast(GL_LINEAR));
 
@@ -561,6 +802,10 @@ pub fn main() !void {
     var spheres: std.ArrayList(GPUSphere) = .empty;
     defer spheres.deinit(allocator);
     try scene.setupScene(allocator, &spheres);
+
+    // Initialize history system
+    history.init(allocator);
+    defer history.deinit();
 
     // Build BVH
     var indices = try allocator.alloc(u32, spheres.items.len);
@@ -644,6 +889,8 @@ pub fn main() !void {
     var triangles = std.ArrayList(GPUTriangle){};
     defer triangles.deinit(allocator);
 
+    // Only load OBJ models if enabled (demo canvas mode = disabled)
+    if (LOAD_OBJ_MODELS) {
     // Try loading OBJ files from models folder
     // Model 1: Golden torus (center)
     if (obj_loader.loadObj(allocator, "models/torus.obj", .{
@@ -720,6 +967,7 @@ pub fn main() !void {
             .emissive = 0.0,
         });
     }
+    } // End LOAD_OBJ_MODELS
 
     std.debug.print("Scene: {} triangles\n", .{triangles.items.len});
 
@@ -925,6 +1173,8 @@ pub fn main() !void {
     var csg_objects = std.ArrayList(types.GPUCSGObject){};
     defer csg_objects.deinit(allocator);
 
+    // Only load CSG objects if enabled (demo canvas mode = disabled)
+    if (LOAD_CSG_OBJECTS) {
     // Demo CSG: Sphere with box subtracted (creates rounded cutout)
     // Primitive 0: Large sphere
     try csg_primitives.append(allocator, .{
@@ -1026,6 +1276,7 @@ pub fn main() !void {
         .emissive = 0,
         .pad = 0,
     });
+    } // End LOAD_CSG_OBJECTS
 
     std.debug.print("CSG primitives: {}, CSG objects: {}\n", .{ csg_primitives.items.len, csg_objects.items.len });
 
@@ -1063,20 +1314,20 @@ pub fn main() !void {
     glBufferData(GL_SHADER_STORAGE_BUFFER, @intCast(csg_obj_buffer_size), csg_obj_buffer_data.ptr, GL_DYNAMIC_DRAW);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 10, csg_obj_ssbo);
 
-    const u_camera_pos_loc = glGetUniformLocation(compute_program, "u_camera_pos");
-    const u_camera_forward_loc = glGetUniformLocation(compute_program, "u_camera_forward");
-    const u_camera_right_loc = glGetUniformLocation(compute_program, "u_camera_right");
-    const u_camera_up_loc = glGetUniformLocation(compute_program, "u_camera_up");
+    var u_camera_pos_loc = glGetUniformLocation(compute_program, "u_camera_pos");
+    var u_camera_forward_loc = glGetUniformLocation(compute_program, "u_camera_forward");
+    var u_camera_right_loc = glGetUniformLocation(compute_program, "u_camera_right");
+    var u_camera_up_loc = glGetUniformLocation(compute_program, "u_camera_up");
     const u_prev_camera_pos_loc = glGetUniformLocation(compute_program, "u_prev_camera_pos");
     const u_prev_camera_forward_loc = glGetUniformLocation(compute_program, "u_prev_camera_forward");
-    const u_fov_scale_loc = glGetUniformLocation(compute_program, "u_fov_scale");
+    var u_fov_scale_loc = glGetUniformLocation(compute_program, "u_fov_scale");
     const u_aperture_loc = glGetUniformLocation(compute_program, "u_aperture");
     const u_focus_dist_loc = glGetUniformLocation(compute_program, "u_focus_dist");
-    const u_frame_loc = glGetUniformLocation(compute_program, "u_frame");
-    const u_sample_loc = glGetUniformLocation(compute_program, "u_sample");
-    const u_width_loc = glGetUniformLocation(compute_program, "u_width");
-    const u_height_loc = glGetUniformLocation(compute_program, "u_height");
-    const u_aspect_loc = glGetUniformLocation(compute_program, "u_aspect");
+    var u_frame_loc = glGetUniformLocation(compute_program, "u_frame");
+    var u_sample_loc = glGetUniformLocation(compute_program, "u_sample");
+    var u_width_loc = glGetUniformLocation(compute_program, "u_width");
+    var u_height_loc = glGetUniformLocation(compute_program, "u_height");
+    var u_aspect_loc = glGetUniformLocation(compute_program, "u_aspect");
 
     // Effect control uniforms
     const u_chromatic_loc = glGetUniformLocation(compute_program, "u_chromatic");
@@ -1133,16 +1384,36 @@ pub fn main() !void {
 
     var frame_count: u32 = 0;
     var total_frames: u32 = 0;
-    var fps_timer = std.time.milliTimestamp();
+    var fps_timer = @as(i64, @intCast(win32.GetTickCount64()));
     var current_fps: f32 = 0;
-    var last_time = std.time.milliTimestamp();
+    var last_time = @as(i64, @intCast(win32.GetTickCount64()));
     var title_buf: [256]u8 = undefined;
 
     while (g_running) {
+        profiler.start(.frame_total);
+
         var msg: win32.MSG = undefined;
         while (win32.PeekMessageA(&msg, null, 0, 0, win32.PM_REMOVE) != 0) {
             _ = win32.TranslateMessage(&msg);
             _ = win32.DispatchMessageA(&msg);
+        }
+
+        // Check for shader hot reload
+        if (shader_loader.hotReload(allocator)) |new_program| {
+            compute_program = new_program;
+            // Re-get uniform locations for new program
+            u_camera_pos_loc = glGetUniformLocation(compute_program, "u_camera_pos");
+            u_camera_forward_loc = glGetUniformLocation(compute_program, "u_camera_forward");
+            u_camera_right_loc = glGetUniformLocation(compute_program, "u_camera_right");
+            u_camera_up_loc = glGetUniformLocation(compute_program, "u_camera_up");
+            u_fov_scale_loc = glGetUniformLocation(compute_program, "u_fov_scale");
+            u_width_loc = glGetUniformLocation(compute_program, "u_width");
+            u_height_loc = glGetUniformLocation(compute_program, "u_height");
+            u_aspect_loc = glGetUniformLocation(compute_program, "u_aspect");
+            u_frame_loc = glGetUniformLocation(compute_program, "u_frame");
+            u_sample_loc = glGetUniformLocation(compute_program, "u_sample");
+            total_frames = 0; // Reset accumulation
+            std.debug.print("Shader hot-reloaded successfully!\n", .{});
         }
 
         // Handle menu actions that modify the scene
@@ -1151,38 +1422,157 @@ pub fn main() !void {
             g_menu_action = 0;
 
             switch (action) {
+                // === FILE OPERATIONS ===
+                IDM_FILE_NEW => {
+                    scene_io.newScene(
+                        &spheres,
+                        @ptrCast(&g_camera_pos.x),
+                        &g_camera_yaw,
+                        &g_camera_pitch,
+                        &g_camera_roll,
+                        &g_fov,
+                        &g_aperture,
+                        &g_focus_dist,
+                        &g_flight_mode,
+                    );
+                    scene.setupScene(allocator, &spheres) catch {};
+                    g_scene_dirty = true;
+                },
+                IDM_FILE_SAVE_SCENE => {
+                    if (image_export.showSaveDialog("Scene Files (*.json)\x00*.json\x00All Files (*.*)\x00*.*\x00", "json")) |filename| {
+                        const path = std.mem.sliceTo(&filename, 0);
+                        scene_io.saveScene(
+                            allocator,
+                            path,
+                            spheres.items,
+                            .{ g_camera_pos.x, g_camera_pos.y, g_camera_pos.z },
+                            g_camera_yaw,
+                            g_camera_pitch,
+                            g_camera_roll,
+                            g_fov,
+                            g_aperture,
+                            g_focus_dist,
+                            g_flight_mode,
+                            g_samples_per_frame,
+                        ) catch |err| {
+                            std.debug.print("Failed to save scene: {}\n", .{err});
+                        };
+                    }
+                },
+                IDM_FILE_LOAD_SCENE => {
+                    if (image_export.showOpenDialog("Scene Files (*.json)\x00*.json\x00All Files (*.*)\x00*.*\x00")) |filename| {
+                        const path = std.mem.sliceTo(&filename, 0);
+                        var cam_pos: [3]f32 = undefined;
+                        scene_io.loadScene(
+                            allocator,
+                            path,
+                            &spheres,
+                            &cam_pos,
+                            &g_camera_yaw,
+                            &g_camera_pitch,
+                            &g_camera_roll,
+                            &g_fov,
+                            &g_aperture,
+                            &g_focus_dist,
+                            &g_flight_mode,
+                            &g_samples_per_frame,
+                        ) catch |err| {
+                            std.debug.print("Failed to load scene: {}\n", .{err});
+                        };
+                        g_camera_pos = vec3.Vec3.init(cam_pos[0], cam_pos[1], cam_pos[2]);
+                        g_scene_dirty = true;
+                    }
+                },
+                IDM_FILE_EXPORT_PNG => {
+                    if (image_export.showSaveDialog("PNG Image (*.png)\x00*.png\x00", "png")) |filename| {
+                        const path = std.mem.sliceTo(&filename, 0);
+                        image_export.exportPNG(allocator, path, g_render_width, g_render_height) catch |err| {
+                            std.debug.print("Failed to export PNG: {}\n", .{err});
+                        };
+                    }
+                },
+                IDM_FILE_EXPORT_BMP => {
+                    if (image_export.showSaveDialog("BMP Image (*.bmp)\x00*.bmp\x00", "bmp")) |filename| {
+                        const path = std.mem.sliceTo(&filename, 0);
+                        image_export.exportBMP(allocator, path, g_render_width, g_render_height) catch |err| {
+                            std.debug.print("Failed to export BMP: {}\n", .{err});
+                        };
+                    }
+                },
+                IDM_FILE_EXPORT_HDR => {
+                    if (image_export.showSaveDialog("HDR Image (*.hdr)\x00*.hdr\x00", "hdr")) |filename| {
+                        const path = std.mem.sliceTo(&filename, 0);
+                        image_export.exportHDR(allocator, path, g_render_width, g_render_height) catch |err| {
+                            std.debug.print("Failed to export HDR: {}\n", .{err});
+                        };
+                    }
+                },
+                IDM_FILE_LOAD_OBJ => {
+                    if (image_export.showOpenDialog("OBJ Files (*.obj)\x00*.obj\x00All Files (*.*)\x00*.*\x00")) |filename| {
+                        const path = std.mem.sliceTo(&filename, 0);
+                        std.debug.print("Selected OBJ: {s}\n", .{path});
+                        // Note: Dynamic OBJ loading requires restart - loaded at startup only
+                        // For now just show a message
+                        _ = win32.MessageBoxA(null, "OBJ files are loaded at startup.\nPlace .obj files in the models/ folder\nand set LOAD_OBJ_MODELS = true.", "OBJ Loading", 0x40);
+                    }
+                },
+                // === SCENE OBJECTS ===
                 IDM_SCENE_ADD_SPHERE => {
                     if (spheres.items.len < MAX_SPHERES) {
-                        const pos = scene.getNextSpawnPosition();
-                        spheres.append(allocator, scene.createDiffuseSphere(pos)) catch {};
+                        const cam_pos = [3]f32{ g_camera_pos.x, g_camera_pos.y, g_camera_pos.z };
+                        const pos = scene.getSpawnPositionInFrontOfCamera(cam_pos, g_camera_yaw);
+                        const new_sphere = scene.createDiffuseSphere(pos);
+                        spheres.append(allocator, new_sphere) catch {};
+                        history.recordAddObject(new_sphere);
                         g_scene_dirty = true;
                     }
                 },
                 IDM_SCENE_ADD_METAL => {
                     if (spheres.items.len < MAX_SPHERES) {
-                        const pos = scene.getNextSpawnPosition();
-                        spheres.append(allocator, scene.createMetalSphere(pos)) catch {};
+                        const cam_pos = [3]f32{ g_camera_pos.x, g_camera_pos.y, g_camera_pos.z };
+                        const pos = scene.getSpawnPositionInFrontOfCamera(cam_pos, g_camera_yaw);
+                        const new_sphere = scene.createMetalSphere(pos);
+                        spheres.append(allocator, new_sphere) catch {};
+                        history.recordAddObject(new_sphere);
                         g_scene_dirty = true;
                     }
                 },
                 IDM_SCENE_ADD_GLASS => {
                     if (spheres.items.len < MAX_SPHERES) {
-                        const pos = scene.getNextSpawnPosition();
-                        spheres.append(allocator, scene.createGlassSphere(pos)) catch {};
+                        const cam_pos = [3]f32{ g_camera_pos.x, g_camera_pos.y, g_camera_pos.z };
+                        const pos = scene.getSpawnPositionInFrontOfCamera(cam_pos, g_camera_yaw);
+                        const new_sphere = scene.createGlassSphere(pos);
+                        spheres.append(allocator, new_sphere) catch {};
+                        history.recordAddObject(new_sphere);
                         g_scene_dirty = true;
                     }
                 },
                 IDM_SCENE_ADD_LIGHT => {
                     if (spheres.items.len < MAX_SPHERES) {
-                        const pos = scene.getNextSpawnPosition();
-                        spheres.append(allocator, scene.createLightSphere(pos)) catch {};
+                        const cam_pos = [3]f32{ g_camera_pos.x, g_camera_pos.y, g_camera_pos.z };
+                        const pos = scene.getSpawnPositionInFrontOfCamera(cam_pos, g_camera_yaw);
+                        const new_sphere = scene.createLightSphere(pos);
+                        spheres.append(allocator, new_sphere) catch {};
+                        history.recordAddObject(new_sphere);
+                        g_scene_dirty = true;
+                    }
+                },
+                IDM_SCENE_ADD_SSS => {
+                    if (spheres.items.len < MAX_SPHERES) {
+                        const cam_pos = [3]f32{ g_camera_pos.x, g_camera_pos.y, g_camera_pos.z };
+                        const pos = scene.getSpawnPositionInFrontOfCamera(cam_pos, g_camera_yaw);
+                        const new_sphere = scene.createSSSSphere(pos);
+                        spheres.append(allocator, new_sphere) catch {};
+                        history.recordAddObject(new_sphere);
                         g_scene_dirty = true;
                     }
                 },
                 IDM_SCENE_REMOVE_LAST => {
                     // Don't remove the ground plane (index 0)
                     if (spheres.items.len > 1) {
-                        _ = spheres.pop();
+                        if (spheres.pop()) |removed| {
+                            history.recordRemoveObject(removed);
+                        }
                         g_scene_dirty = true;
                     }
                 },
@@ -1190,6 +1580,7 @@ pub fn main() !void {
                     spheres.clearRetainingCapacity();
                     scene.resetSpawnPosition();
                     scene.setupScene(allocator, &spheres) catch {};
+                    history.clear(); // Clear undo/redo history on reset
                     g_scene_dirty = true;
                 },
                 else => {},
@@ -1198,12 +1589,28 @@ pub fn main() !void {
 
         // Rebuild and re-upload scene if modified
         if (g_scene_dirty) {
+            profiler.start(.scene_upload);
             g_scene_dirty = false;
             uploadScene(allocator, &spheres, &bvh_nodes, sphere_ssbo, bvh_ssbo) catch {};
             total_frames = 0; // Reset accumulation
+            profiler.end(.scene_upload);
+            // Update profiler scene stats
+            profiler.global.updateSceneStats(spheres.items.len, 0, bvh_nodes.items.len);
         }
 
-        const current_time = std.time.milliTimestamp();
+        // Handle resolution change
+        if (g_resolution_changed) {
+            g_resolution_changed = false;
+            // Resize textures
+            gl.glBindTexture(GL_TEXTURE_2D, output_texture);
+            gl.glTexImage2D(GL_TEXTURE_2D, 0, @intCast(GL_RGBA32F), @intCast(g_render_width), @intCast(g_render_height), 0, GL_RGBA, GL_FLOAT, null);
+            gl.glBindTexture(GL_TEXTURE_2D, accum_texture);
+            gl.glTexImage2D(GL_TEXTURE_2D, 0, @intCast(GL_RGBA32F), @intCast(g_render_width), @intCast(g_render_height), 0, GL_RGBA, GL_FLOAT, null);
+            total_frames = 0; // Reset accumulation
+            std.debug.print("Resolution changed to {}x{}\n", .{ g_render_width, g_render_height });
+        }
+
+        const current_time = @as(i64, @intCast(win32.GetTickCount64()));
         const delta_time: f32 = @as(f32, @floatFromInt(current_time - last_time)) / 1000.0;
         last_time = current_time;
 
@@ -1247,30 +1654,39 @@ pub fn main() !void {
 
         const move_speed: f32 = 8.0 * delta_time;
 
-        // Q/E - Roll control (only in flight mode)
-        if (g_flight_mode) {
-            if (g_keys['Q']) { g_camera_roll -= 2.0 * delta_time; camera_moved = true; }
-            if (g_keys['E']) { g_camera_roll += 2.0 * delta_time; camera_moved = true; }
-        }
+        // Disable movement when console is open
+        if (!g_show_console) {
+            // Q/E - Roll control (only in flight mode)
+            if (g_flight_mode) {
+                if (g_keys['Q']) { g_camera_roll -= 2.0 * delta_time; camera_moved = true; }
+                if (g_keys['E']) { g_camera_roll += 2.0 * delta_time; camera_moved = true; }
+            }
 
-        // Movement differs based on camera mode
-        if (g_flight_mode) {
-            // Flight simulator mode: W/S move in the direction you're looking
-            if (g_keys['W']) { g_camera_pos = g_camera_pos.add(forward.scale(move_speed)); camera_moved = true; }
-            if (g_keys['S']) { g_camera_pos = g_camera_pos.add(forward.scale(-move_speed)); camera_moved = true; }
-            if (g_keys['A']) { g_camera_pos = g_camera_pos.add(right.scale(-move_speed)); camera_moved = true; }
-            if (g_keys['D']) { g_camera_pos = g_camera_pos.add(right.scale(move_speed)); camera_moved = true; }
-            // Space/Ctrl move along local up vector (strafe up/down relative to camera)
-            if (g_keys[' ']) { g_camera_pos = g_camera_pos.add(up.scale(move_speed)); camera_moved = true; }
-            if (g_keys[win32.VK_CONTROL]) { g_camera_pos = g_camera_pos.add(up.scale(-move_speed)); camera_moved = true; }
-        } else {
-            // FPS mode: W/S move forward on XZ plane, Space/Ctrl move on Y axis
-            if (g_keys['W']) { g_camera_pos = g_camera_pos.add(forward.scale(move_speed)); camera_moved = true; }
-            if (g_keys['S']) { g_camera_pos = g_camera_pos.add(forward.scale(-move_speed)); camera_moved = true; }
-            if (g_keys['A']) { g_camera_pos = g_camera_pos.add(right.scale(-move_speed)); camera_moved = true; }
-            if (g_keys['D']) { g_camera_pos = g_camera_pos.add(right.scale(move_speed)); camera_moved = true; }
-            if (g_keys[' ']) { g_camera_pos.y += move_speed; camera_moved = true; }
-            if (g_keys[win32.VK_CONTROL]) { g_camera_pos.y -= move_speed; camera_moved = true; }
+            // Movement differs based on camera mode
+            if (g_flight_mode) {
+                // Flight simulator mode: W/S move in the direction you're looking
+                if (g_keys['W']) { g_camera_pos = g_camera_pos.add(forward.scale(move_speed)); camera_moved = true; }
+                if (g_keys['S']) { g_camera_pos = g_camera_pos.add(forward.scale(-move_speed)); camera_moved = true; }
+                if (g_keys['A']) { g_camera_pos = g_camera_pos.add(right.scale(-move_speed)); camera_moved = true; }
+                if (g_keys['D']) { g_camera_pos = g_camera_pos.add(right.scale(move_speed)); camera_moved = true; }
+                // Space/Ctrl move along local up vector (strafe up/down relative to camera)
+                if (g_keys[' ']) { g_camera_pos = g_camera_pos.add(up.scale(move_speed)); camera_moved = true; }
+            } else {
+                // FPS mode: W/S move forward on XZ plane, Space/Ctrl move on Y axis
+                if (g_keys['W']) { g_camera_pos = g_camera_pos.add(forward.scale(move_speed)); camera_moved = true; }
+                if (g_keys['S']) { g_camera_pos = g_camera_pos.add(forward.scale(-move_speed)); camera_moved = true; }
+                if (g_keys['A']) { g_camera_pos = g_camera_pos.add(right.scale(-move_speed)); camera_moved = true; }
+                if (g_keys['D']) { g_camera_pos = g_camera_pos.add(right.scale(move_speed)); camera_moved = true; }
+                if (g_keys[' ']) { g_camera_pos.y += move_speed; camera_moved = true; }
+                // Ctrl for down - only when HUD is closed (otherwise Ctrl is for shortcuts)
+                if (!g_show_hud and g_keys[win32.VK_CONTROL]) { g_camera_pos.y -= move_speed; camera_moved = true; }
+            }
+
+            // Clamp camera height - don't allow going below ground level
+            const MIN_CAMERA_HEIGHT: f32 = 0.5;
+            if (g_camera_pos.y < MIN_CAMERA_HEIGHT) {
+                g_camera_pos.y = MIN_CAMERA_HEIGHT;
+            }
         }
         if (g_keys['R']) {
             // Reset camera
@@ -1321,13 +1737,178 @@ pub fn main() !void {
             g_dither = 0.0;
             g_holographic = 0.0;
             g_ascii_mode = 0.0;
-            g_fov = 20.0;
+            g_fov = 60.0;
             g_aperture = 0.0;
             g_focus_dist = 10.0;
             camera_moved = true;
             g_keys['R'] = false;
         }
         if (g_keys[win32.VK_ESCAPE]) g_running = false;
+
+        // === GLOBAL SHORTCUTS (work anytime, no HUD needed) ===
+        // F/G - FOV adjust
+        if (g_keys['F'] and !g_keys[win32.VK_CONTROL]) { g_fov = @max(10.0, g_fov - 2.0); camera_moved = true; g_keys['F'] = false; }
+        if (g_keys['G']) { g_fov = @min(120.0, g_fov + 2.0); camera_moved = true; g_keys['G'] = false; }
+        // +/- or =/- keys for Exposure (easy global access)
+        if (g_keys[0xBB]) { g_exposure = @min(g_exposure + 0.1, 5.0); camera_moved = true; g_keys[0xBB] = false; } // = key (plus)
+        if (g_keys[0xBD]) { g_exposure = @max(g_exposure - 0.1, 0.0); camera_moved = true; g_keys[0xBD] = false; } // - key (minus)
+
+        // === TAB-SPECIFIC SHORTCUTS ===
+        // Only process when HUD is shown and not in console
+        if (g_show_hud and !g_show_console) {
+            // TAB 0 - SPAWN: Ctrl+1-5 for spheres
+            if (hud.current_tab == 0 and g_keys[win32.VK_CONTROL]) {
+                if (g_keys['1']) { g_menu_action = IDM_SCENE_ADD_SPHERE; g_keys['1'] = false; }
+                if (g_keys['2']) { g_menu_action = IDM_SCENE_ADD_METAL; g_keys['2'] = false; }
+                if (g_keys['3']) { g_menu_action = IDM_SCENE_ADD_GLASS; g_keys['3'] = false; }
+                if (g_keys['4']) { g_menu_action = IDM_SCENE_ADD_LIGHT; g_keys['4'] = false; }
+                if (g_keys['5']) { g_menu_action = IDM_SCENE_ADD_SSS; g_keys['5'] = false; }
+                if (g_keys['0']) { g_menu_action = IDM_FILE_LOAD_OBJ; g_keys['0'] = false; }
+            }
+
+            // TAB 1 - EFFECTS: Single key = increase, Shift+key = decrease
+            if (hud.current_tab == 1) {
+                const shift = g_keys[win32.VK_SHIFT];
+                if (g_keys['B']) { // Bloom
+                    if (shift) g_bloom_strength = @max(g_bloom_strength - 0.05, 0.0)
+                    else g_bloom_strength = @min(g_bloom_strength + 0.05, 1.0);
+                    camera_moved = true; g_keys['B'] = false;
+                }
+                if (g_keys['X']) { // Exposure
+                    if (shift) g_exposure = @max(g_exposure - 0.25, 0.0)
+                    else g_exposure = @min(g_exposure + 0.25, 5.0);
+                    camera_moved = true; g_keys['X'] = false;
+                }
+                if (g_keys['C']) { // Chromatic
+                    if (shift) g_chromatic_strength = @max(g_chromatic_strength - 0.002, 0.0)
+                    else g_chromatic_strength = @min(g_chromatic_strength + 0.002, 0.02);
+                    camera_moved = true; g_keys['C'] = false;
+                }
+                if (g_keys['V']) { // Vignette
+                    if (shift) g_vignette_strength = @max(g_vignette_strength - 0.05, 0.0)
+                    else g_vignette_strength = @min(g_vignette_strength + 0.05, 0.5);
+                    camera_moved = true; g_keys['V'] = false;
+                }
+                if (g_keys['M']) { // Motion blur
+                    if (shift) g_motion_blur_strength = @max(g_motion_blur_strength - 0.1, 0.0)
+                    else g_motion_blur_strength = @min(g_motion_blur_strength + 0.1, 2.0);
+                    camera_moved = true; g_keys['M'] = false;
+                }
+                if (g_keys['N'] and !g_keys[win32.VK_CONTROL]) { // Film grain
+                    if (shift) g_film_grain = @max(g_film_grain - 0.05, 0.0)
+                    else g_film_grain = @min(g_film_grain + 0.05, 1.0);
+                    camera_moved = true; g_keys['N'] = false;
+                }
+                if (g_keys['J']) { // Denoise
+                    if (shift) g_denoise_strength = @max(g_denoise_strength - 0.1, 0.0)
+                    else g_denoise_strength = @min(g_denoise_strength + 0.1, 2.0);
+                    camera_moved = true; g_keys['J'] = false;
+                }
+            }
+
+            // TAB 2 - CAMERA: T/Y, U/I, P
+            if (hud.current_tab == 2) {
+                if (g_keys['T']) { g_aperture = @max(0.0, g_aperture - 0.01); camera_moved = true; g_keys['T'] = false; }
+                if (g_keys['Y'] and !g_keys[win32.VK_CONTROL]) { g_aperture = @min(0.5, g_aperture + 0.01); camera_moved = true; g_keys['Y'] = false; }
+                if (g_keys['U']) { g_focus_dist = @max(1.0, g_focus_dist - 1.0); camera_moved = true; g_keys['U'] = false; }
+                if (g_keys['I']) { g_focus_dist = @min(100.0, g_focus_dist + 1.0); camera_moved = true; g_keys['I'] = false; }
+                if (g_keys['P']) {
+                    g_flight_mode = !g_flight_mode;
+                    if (!g_flight_mode) g_camera_roll = 0.0;
+                    camera_moved = true;
+                    g_keys['P'] = false;
+                }
+            }
+
+            // TAB 3 - DEBUG: 1-4 (Quality), 5-8 (Debug modes)
+            if (hud.current_tab == 3) {
+                if (g_keys['1']) { g_samples_per_frame = 2; camera_moved = true; g_keys['1'] = false; }
+                if (g_keys['2']) { g_samples_per_frame = 4; camera_moved = true; g_keys['2'] = false; }
+                if (g_keys['3']) { g_samples_per_frame = 8; camera_moved = true; g_keys['3'] = false; }
+                if (g_keys['4']) { g_samples_per_frame = 16; camera_moved = true; g_keys['4'] = false; }
+                if (g_keys['5']) { g_debug_mode = 0; camera_moved = true; g_keys['5'] = false; }
+                if (g_keys['6']) { g_debug_mode = 1; camera_moved = true; g_keys['6'] = false; }
+                if (g_keys['7']) { g_debug_mode = 2; camera_moved = true; g_keys['7'] = false; }
+                if (g_keys['8']) { g_debug_mode = 3; camera_moved = true; g_keys['8'] = false; }
+            }
+        }
+
+        // === FILE SHORTCUTS (always available) ===
+        // Ctrl+N - New Scene
+        if (g_keys['N'] and g_keys[win32.VK_CONTROL]) {
+            g_menu_action = IDM_FILE_NEW;
+            g_keys['N'] = false;
+        }
+        // Ctrl+O - Open Scene
+        if (g_keys['O'] and g_keys[win32.VK_CONTROL]) {
+            g_menu_action = IDM_FILE_LOAD_SCENE;
+            g_keys['O'] = false;
+        }
+        // Ctrl+S - Save Scene
+        if (g_keys['S'] and g_keys[win32.VK_CONTROL]) {
+            g_menu_action = IDM_FILE_SAVE_SCENE;
+            g_keys['S'] = false;
+        }
+        // Ctrl+E - Export PNG
+        if (g_keys['E'] and g_keys[win32.VK_CONTROL]) {
+            g_menu_action = IDM_FILE_EXPORT_PNG;
+            g_keys['E'] = false;
+        }
+        // Ctrl+Z - Undo
+        if (g_keys['Z'] and g_keys[win32.VK_CONTROL]) {
+            if (history.undo()) |action| {
+                switch (action.action_type) {
+                    .add_object => {
+                        // Undo add = remove last
+                        if (spheres.items.len > 1) {
+                            _ = spheres.pop();
+                            g_scene_dirty = true;
+                        }
+                    },
+                    .remove_object => {
+                        // Undo remove = add back the object
+                        if (action.object_data) |obj| {
+                            if (spheres.items.len < MAX_SPHERES) {
+                                spheres.append(allocator, obj) catch {};
+                                g_scene_dirty = true;
+                            }
+                        }
+                    },
+                    else => {},
+                }
+            }
+            g_keys['Z'] = false;
+        }
+        // Ctrl+Y - Redo
+        if (g_keys['Y'] and g_keys[win32.VK_CONTROL]) {
+            if (history.redo()) |action| {
+                switch (action.action_type) {
+                    .add_object => {
+                        // Redo add = add object
+                        if (action.object_data) |obj| {
+                            if (spheres.items.len < MAX_SPHERES) {
+                                spheres.append(allocator, obj) catch {};
+                                g_scene_dirty = true;
+                            }
+                        }
+                    },
+                    .remove_object => {
+                        // Redo remove = remove last
+                        if (spheres.items.len > 1) {
+                            _ = spheres.pop();
+                            g_scene_dirty = true;
+                        }
+                    },
+                    else => {},
+                }
+            }
+            g_keys['Y'] = false;
+        }
+        // Del - Remove last object
+        if (g_keys[0x2E]) { // VK_DELETE
+            g_menu_action = IDM_SCENE_REMOVE_LAST;
+            g_keys[0x2E] = false;
+        }
 
         // === RUNTIME CONTROLS ===
         // F12 - Screenshot
@@ -1340,402 +1921,16 @@ pub fn main() !void {
             g_show_help = !g_show_help;
             g_keys['H'] = false;
         }
-        // F/G - FOV adjust
-        if (g_keys['F']) { g_fov = @max(10.0, g_fov - 2.0); camera_moved = true; g_keys['F'] = false; }
-        if (g_keys['G']) { g_fov = @min(120.0, g_fov + 2.0); camera_moved = true; g_keys['G'] = false; }
-        // T/Y - Aperture (DOF)
-        if (g_keys['T']) { g_aperture = @max(0.0, g_aperture - 0.01); camera_moved = true; g_keys['T'] = false; }
-        if (g_keys['Y']) { g_aperture = @min(0.5, g_aperture + 0.01); camera_moved = true; g_keys['Y'] = false; }
-        // U/I - Focus distance
-        if (g_keys['U']) { g_focus_dist = @max(1.0, g_focus_dist - 1.0); camera_moved = true; g_keys['U'] = false; }
-        if (g_keys['I']) { g_focus_dist = @min(100.0, g_focus_dist + 1.0); camera_moved = true; g_keys['I'] = false; }
-        // 1-4 - Quality presets
-        if (g_keys['1']) { g_samples_per_frame = 2; g_keys['1'] = false; }
-        if (g_keys['2']) { g_samples_per_frame = 4; g_keys['2'] = false; }
-        if (g_keys['3']) { g_samples_per_frame = 8; g_keys['3'] = false; }
-        if (g_keys['4']) { g_samples_per_frame = 16; g_keys['4'] = false; }
 
-        // P - Toggle flight mode (pilot mode with roll control)
-        if (g_keys['P']) {
-            g_flight_mode = !g_flight_mode;
-            if (!g_flight_mode) g_camera_roll = 0.0; // Reset roll when exiting flight mode
-            camera_moved = true;
-            g_keys['P'] = false;
-        }
-
-        // 5-8 - Debug visualization modes
-        if (g_keys['5']) { g_debug_mode = 0; camera_moved = true; g_keys['5'] = false; } // Normal
-        if (g_keys['6']) { g_debug_mode = 1; camera_moved = true; g_keys['6'] = false; } // BVH Heatmap
-        if (g_keys['7']) { g_debug_mode = 2; camera_moved = true; g_keys['7'] = false; } // Normals
-        if (g_keys['8']) { g_debug_mode = 3; camera_moved = true; g_keys['8'] = false; } // Depth
-
-        // ============ EFFECT CONTROLS ============
-        // C - Chromatic aberration (hold Shift for decrease)
-        if (g_keys['C']) {
-            if (g_keys[0x10]) { // Shift
-                g_chromatic_strength = @max(0.0, g_chromatic_strength - 0.001);
-            } else {
-                g_chromatic_strength = @min(0.02, g_chromatic_strength + 0.001);
-            }
-            camera_moved = true; g_keys['C'] = false;
-        }
-        // M - Motion blur (hold Shift for decrease)
-        if (g_keys['M']) {
-            if (g_keys[0x10]) {
-                g_motion_blur_strength = @max(0.0, g_motion_blur_strength - 0.1);
-            } else {
-                g_motion_blur_strength = @min(2.0, g_motion_blur_strength + 0.1);
-            }
-            camera_moved = true; g_keys['M'] = false;
-        }
-        // B - Bloom (hold Shift for decrease)
-        if (g_keys['B']) {
-            if (g_keys[0x10]) {
-                g_bloom_strength = @max(0.0, g_bloom_strength - 0.05);
-            } else {
-                g_bloom_strength = @min(1.0, g_bloom_strength + 0.05);
-            }
-            camera_moved = true; g_keys['B'] = false;
-        }
-        // N - Toggle NEE (Next Event Estimation)
-        if (g_keys['N']) {
-            g_nee_enabled = !g_nee_enabled;
-            camera_moved = true; g_keys['N'] = false;
-        }
-        // R - Roughness multiplier (hold Shift for decrease)
-        if (g_keys['R']) {
-            if (g_keys[0x10]) {
-                g_roughness_mult = @max(0.1, g_roughness_mult - 0.1);
-            } else {
-                g_roughness_mult = @min(3.0, g_roughness_mult + 0.1);
-            }
-            camera_moved = true; g_keys['R'] = false;
-        }
-        // E - Exposure (hold Shift for decrease)
-        if (g_keys['E']) {
-            if (g_keys[0x10]) {
-                g_exposure = @max(0.1, g_exposure - 0.1);
-            } else {
-                g_exposure = @min(5.0, g_exposure + 0.1);
-            }
-            camera_moved = true; g_keys['E'] = false;
-        }
-        // V - Vignette (hold Shift for decrease)
-        if (g_keys['V']) {
-            if (g_keys[0x10]) {
-                g_vignette_strength = @max(0.0, g_vignette_strength - 0.05);
-            } else {
-                g_vignette_strength = @min(0.5, g_vignette_strength + 0.05);
-            }
-            camera_moved = true; g_keys['V'] = false;
-        }
-        // M - Normal mapping strength (hold Shift for decrease)
-        if (g_keys['M']) {
-            if (g_keys[0x10]) {
-                g_normal_strength = @max(0.0, g_normal_strength - 0.25);
-            } else {
-                g_normal_strength = @min(5.0, g_normal_strength + 0.25);
-            }
-            camera_moved = true; g_keys['M'] = false;
-        }
-        // J - Displacement/parallax mapping strength (hold Shift for decrease)
-        if (g_keys['J']) {
-            if (g_keys[0x10]) {
-                g_displacement = @max(0.0, g_displacement - 0.1);
-            } else {
-                g_displacement = @min(3.0, g_displacement + 0.1);
-            }
-            camera_moved = true; g_keys['J'] = false;
-        }
-        // O - Denoising strength (hold Shift for decrease)
-        if (g_keys['O']) {
-            if (g_keys[0x10]) {
-                g_denoise_strength = @max(0.0, g_denoise_strength - 0.1);
-            } else {
-                g_denoise_strength = @min(2.0, g_denoise_strength + 0.1);
-            }
-            camera_moved = true; g_keys['O'] = false;
-        }
-        // P - Volumetric fog density (hold Shift for decrease)
-        if (g_keys['P']) {
-            if (g_keys[0x10]) {
-                g_fog_density = @max(0.0, g_fog_density - 0.01);
-            } else {
-                g_fog_density = @min(0.5, g_fog_density + 0.01);
-            }
-            camera_moved = true; g_keys['P'] = false;
-        }
-        // G - Film grain (hold Shift for decrease)
-        if (g_keys['G']) {
-            if (g_keys[0x10]) {
-                g_film_grain = @max(0.0, g_film_grain - 0.1);
-            } else {
-                g_film_grain = @min(2.0, g_film_grain + 0.1);
-            }
-            camera_moved = true; g_keys['G'] = false;
-        }
-        // K - Cycle bokeh shape (circle/hexagon/star/heart)
-        if (g_keys['K']) {
-            g_bokeh_shape = @mod(g_bokeh_shape + 1, 4);
-            camera_moved = true; g_keys['K'] = false;
-        }
-        // Y - Glass dispersion (hold Shift for decrease)
-        if (g_keys['Y']) {
-            if (g_keys[0x10]) {
-                g_dispersion = @max(0.0, g_dispersion - 0.1);
-            } else {
-                g_dispersion = @min(2.0, g_dispersion + 0.1);
-            }
-            camera_moved = true; g_keys['Y'] = false;
-        }
-        // L - Lens flare (hold Shift for decrease)
-        if (g_keys['L']) {
-            if (g_keys[0x10]) {
-                g_lens_flare = @max(0.0, g_lens_flare - 0.1);
-            } else {
-                g_lens_flare = @min(2.0, g_lens_flare + 0.1);
-            }
-            camera_moved = true; g_keys['L'] = false;
-        }
-        // 5 - Iridescence / thin-film interference (hold Shift for decrease)
-        if (g_keys['5']) {
-            if (g_keys[0x10]) {
-                g_iridescence = @max(0.0, g_iridescence - 0.1);
-            } else {
-                g_iridescence = @min(2.0, g_iridescence + 0.1);
-            }
-            camera_moved = true; g_keys['5'] = false;
-        }
-        // 6 - Anisotropic reflections / brushed metal (hold Shift for decrease)
-        if (g_keys['6']) {
-            if (g_keys[0x10]) {
-                g_anisotropy = @max(0.0, g_anisotropy - 0.1);
-            } else {
-                g_anisotropy = @min(1.0, g_anisotropy + 0.1);
-            }
-            camera_moved = true; g_keys['6'] = false;
-        }
-        // 7 - Color temperature (-1 cool to +1 warm)
-        if (g_keys['7']) {
-            if (g_keys[0x10]) {
-                g_color_temp = @max(-1.0, g_color_temp - 0.1);
-            } else {
-                g_color_temp = @min(1.0, g_color_temp + 0.1);
-            }
-            camera_moved = true; g_keys['7'] = false;
-        }
-        // 8 - Saturation
-        if (g_keys['8']) {
-            if (g_keys[0x10]) {
-                g_saturation = @max(0.0, g_saturation - 0.1);
-            } else {
-                g_saturation = @min(2.0, g_saturation + 0.1);
-            }
-            camera_moved = true; g_keys['8'] = false;
-        }
-        // 9 - CRT scanlines
-        if (g_keys['9']) {
-            if (g_keys[0x10]) {
-                g_scanlines = @max(0.0, g_scanlines - 0.1);
-            } else {
-                g_scanlines = @min(1.0, g_scanlines + 0.1);
-            }
-            camera_moved = true; g_keys['9'] = false;
-        }
-        // 0 - Tilt-shift miniature effect
-        if (g_keys['0']) {
-            if (g_keys[0x10]) {
-                g_tilt_shift = @max(0.0, g_tilt_shift - 0.1);
-            } else {
-                g_tilt_shift = @min(1.0, g_tilt_shift + 0.1);
-            }
-            camera_moved = true; g_keys['0'] = false;
-        }
-        // Z - Glitter/sparkle intensity
-        if (g_keys['Z']) {
-            if (g_keys[0x10]) {
-                g_glitter = @max(0.0, g_glitter - 0.1);
-            } else {
-                g_glitter = @min(1.0, g_glitter + 0.1);
-            }
-            camera_moved = true; g_keys['Z'] = false;
-        }
-        // X - Heat haze distortion
-        if (g_keys['X']) {
-            if (g_keys[0x10]) {
-                g_heat_haze = @max(0.0, g_heat_haze - 0.05);
-            } else {
-                g_heat_haze = @min(0.5, g_heat_haze + 0.05);
-            }
-            camera_moved = true; g_keys['X'] = false;
-        }
-        // ============ MEGA EFFECTS BATCH 2 CONTROLS ============
-        // F1 - Kaleidoscope (segments)
-        if (g_keys[win32.VK_F1]) {
-            if (g_keys[0x10]) {
-                g_kaleidoscope = @max(0.0, g_kaleidoscope - 1.0);
-            } else {
-                g_kaleidoscope = @min(12.0, g_kaleidoscope + 1.0);
-            }
-            camera_moved = true; g_keys[win32.VK_F1] = false;
-        }
-        // F2 - Pixelation
-        if (g_keys[win32.VK_F2]) {
-            if (g_keys[0x10]) {
-                g_pixelate = @max(0.0, g_pixelate - 0.1);
-            } else {
-                g_pixelate = @min(1.0, g_pixelate + 0.1);
-            }
-            camera_moved = true; g_keys[win32.VK_F2] = false;
-        }
-        // F3 - Edge detection / toon
-        if (g_keys[win32.VK_F3]) {
-            if (g_keys[0x10]) {
-                g_edge_detect = @max(0.0, g_edge_detect - 0.1);
-            } else {
-                g_edge_detect = @min(1.0, g_edge_detect + 0.1);
-            }
-            camera_moved = true; g_keys[win32.VK_F3] = false;
-        }
-        // F4 - Halftone / comic
-        if (g_keys[win32.VK_F4]) {
-            if (g_keys[0x10]) {
-                g_halftone = @max(0.0, g_halftone - 0.1);
-            } else {
-                g_halftone = @min(1.0, g_halftone + 0.1);
-            }
-            camera_moved = true; g_keys[win32.VK_F4] = false;
-        }
-        // F5 - Night vision
-        if (g_keys[win32.VK_F5]) {
-            if (g_keys[0x10]) {
-                g_night_vision = @max(0.0, g_night_vision - 0.1);
-            } else {
-                g_night_vision = @min(1.0, g_night_vision + 0.1);
-            }
-            camera_moved = true; g_keys[win32.VK_F5] = false;
-        }
-        // F6 - Thermal vision
-        if (g_keys[win32.VK_F6]) {
-            if (g_keys[0x10]) {
-                g_thermal = @max(0.0, g_thermal - 0.1);
-            } else {
-                g_thermal = @min(1.0, g_thermal + 0.1);
-            }
-            camera_moved = true; g_keys[win32.VK_F6] = false;
-        }
-        // F7 - Underwater
-        if (g_keys[win32.VK_F7]) {
-            if (g_keys[0x10]) {
-                g_underwater = @max(0.0, g_underwater - 0.1);
-            } else {
-                g_underwater = @min(1.0, g_underwater + 0.1);
-            }
-            camera_moved = true; g_keys[win32.VK_F7] = false;
-        }
-        // F8 - Rain drops
-        if (g_keys[win32.VK_F8]) {
-            if (g_keys[0x10]) {
-                g_rain_drops = @max(0.0, g_rain_drops - 0.1);
-            } else {
-                g_rain_drops = @min(1.0, g_rain_drops + 0.1);
-            }
-            camera_moved = true; g_keys[win32.VK_F8] = false;
-        }
-        // F9 - VHS effect
-        if (g_keys[win32.VK_F9]) {
-            if (g_keys[0x10]) {
-                g_vhs_effect = @max(0.0, g_vhs_effect - 0.1);
-            } else {
-                g_vhs_effect = @min(1.0, g_vhs_effect + 0.1);
-            }
-            camera_moved = true; g_keys[win32.VK_F9] = false;
-        }
-        // F10 - 3D Anaglyph
-        if (g_keys[win32.VK_F10]) {
-            if (g_keys[0x10]) {
-                g_anaglyph_3d = @max(0.0, g_anaglyph_3d - 0.1);
-            } else {
-                g_anaglyph_3d = @min(1.0, g_anaglyph_3d + 0.1);
-            }
-            camera_moved = true; g_keys[win32.VK_F10] = false;
-        }
-        // F11 - Fisheye
-        if (g_keys[win32.VK_F11]) {
-            if (g_keys[0x10]) {
-                g_fisheye = @max(0.0, g_fisheye - 0.1);
-            } else {
-                g_fisheye = @min(1.0, g_fisheye + 0.1);
-            }
-            camera_moved = true; g_keys[win32.VK_F11] = false;
-        }
-        // Q - Posterize (levels 2-16)
-        if (g_keys['Q']) {
-            if (g_keys[0x10]) {
-                g_posterize = @max(0.0, g_posterize - 1.0);
-            } else {
-                g_posterize = @min(16.0, g_posterize + 1.0);
-            }
-            camera_moved = true; g_keys['Q'] = false;
-        }
-        // [ - Sepia
-        if (g_keys[0xDB]) { // VK_OEM_4 = [
-            if (g_keys[0x10]) {
-                g_sepia = @max(0.0, g_sepia - 0.1);
-            } else {
-                g_sepia = @min(1.0, g_sepia + 0.1);
-            }
-            camera_moved = true; g_keys[0xDB] = false;
-        }
-        // ] - Frosted glass
-        if (g_keys[0xDD]) { // VK_OEM_6 = ]
-            if (g_keys[0x10]) {
-                g_frosted = @max(0.0, g_frosted - 0.1);
-            } else {
-                g_frosted = @min(1.0, g_frosted + 0.1);
-            }
-            camera_moved = true; g_keys[0xDD] = false;
-        }
-        // \ - Radial blur
-        if (g_keys[0xDC]) { // VK_OEM_5 = backslash
-            if (g_keys[0x10]) {
-                g_radial_blur = @max(0.0, g_radial_blur - 0.1);
-            } else {
-                g_radial_blur = @min(1.0, g_radial_blur + 0.1);
-            }
-            camera_moved = true; g_keys[0xDC] = false;
-        }
-        // ; - Dithering
-        if (g_keys[0xBA]) { // VK_OEM_1 = ;
-            if (g_keys[0x10]) {
-                g_dither = @max(0.0, g_dither - 0.1);
-            } else {
-                g_dither = @min(1.0, g_dither + 0.1);
-            }
-            camera_moved = true; g_keys[0xBA] = false;
-        }
-        // ' - Holographic
-        if (g_keys[0xDE]) { // VK_OEM_7 = '
-            if (g_keys[0x10]) {
-                g_holographic = @max(0.0, g_holographic - 0.1);
-            } else {
-                g_holographic = @min(1.0, g_holographic + 0.1);
-            }
-            camera_moved = true; g_keys[0xDE] = false;
-        }
-        // , - ASCII mode
-        if (g_keys[0xBC]) { // VK_OEM_COMMA
-            if (g_keys[0x10]) {
-                g_ascii_mode = @max(0.0, g_ascii_mode - 0.1);
-            } else {
-                g_ascii_mode = @min(1.0, g_ascii_mode + 0.1);
-            }
-            camera_moved = true; g_keys[0xBC] = false;
-        }
         // TAB - Toggle HUD
         if (g_keys[win32.VK_TAB]) {
             g_show_hud = !g_show_hud;
             g_keys[win32.VK_TAB] = false;
+        }
+        // Tilde/Backtick (~) - Toggle debug console
+        if (g_keys[0xC0]) { // VK_OEM_3 = tilde/backtick key
+            g_show_console = !g_show_console;
+            g_keys[0xC0] = false;
         }
 
         // Reset accumulation when camera moves
@@ -1757,9 +1952,9 @@ pub fn main() !void {
         glUniform1f(u_fov_scale_loc, 1.0 / @tan(g_fov * std.math.pi / 180.0 / 2.0));
         glUniform1f(u_aperture_loc, g_aperture);
         glUniform1f(u_focus_dist_loc, g_focus_dist);
-        glUniform1i(u_width_loc, @intCast(RENDER_WIDTH));
-        glUniform1i(u_height_loc, @intCast(RENDER_HEIGHT));
-        glUniform1f(u_aspect_loc, @as(f32, @floatFromInt(RENDER_WIDTH)) / @as(f32, @floatFromInt(RENDER_HEIGHT)));
+        glUniform1i(u_width_loc, @intCast(g_render_width));
+        glUniform1i(u_height_loc, @intCast(g_render_height));
+        glUniform1f(u_aspect_loc, @as(f32, @floatFromInt(g_render_width)) / @as(f32, @floatFromInt(g_render_height)));
         glUniform1ui(u_frame_loc, total_frames);
 
         // Effect controls
@@ -1809,16 +2004,23 @@ pub fn main() !void {
         glUniform1i(u_debug_mode_loc, g_debug_mode);
         glUniform1i(u_instance_bvh_root_loc, -1); // -1 = linear search, no BVH
 
-        const groups_x = (RENDER_WIDTH + 15) / 16;
-        const groups_y = (RENDER_HEIGHT + 15) / 16;
+        const groups_x = (g_render_width + 15) / 16;
+        const groups_y = (g_render_height + 15) / 16;
 
+        // Profile ray generation and shading
+        profiler.start(.ray_generation);
         var sample_idx: u32 = 0;
         while (sample_idx < g_samples_per_frame) : (sample_idx += 1) {
             glUniform1ui(u_sample_loc, sample_idx);
             glDispatchCompute(groups_x, groups_y, 1);
             glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
         }
+        profiler.end(.ray_generation);
 
+        // Update render stats
+        profiler.global.updateRenderStats(total_frames, g_render_width, g_render_height, MAX_DEPTH);
+
+        profiler.start(.post_processing);
         gl.glDisable(gl.GL_BLEND);  // Ensure blending is off BEFORE clear
         gl.glClear(gl.GL_COLOR_BUFFER_BIT);
         gl.glColor4f(1.0, 1.0, 1.0, 1.0);  // Full opacity for texture
@@ -1830,9 +2032,11 @@ pub fn main() !void {
         gl.glTexCoord2f(1, 0); gl.glVertex2f(1, 1);
         gl.glTexCoord2f(0, 0); gl.glVertex2f(-1, 1);
         gl.glEnd();
+        profiler.end(.post_processing);
 
         // Render HUD overlay
-        hud.render(@intCast(RENDER_WIDTH), @intCast(RENDER_HEIGHT), .{
+        profiler.start(.hud_render);
+        hud.render(@intCast(g_render_width), @intCast(g_render_height), .{
             .fov = g_fov,
             .aperture = g_aperture,
             .focus_dist = g_focus_dist,
@@ -1861,9 +2065,21 @@ pub fn main() !void {
             .halftone = g_halftone,
             .vhs_effect = g_vhs_effect,
             .anaglyph_3d = g_anaglyph_3d,
-        }, g_show_hud); // Press TAB to toggle HUD
+            .motion_blur = g_motion_blur_strength,
+            .edge_detect = g_edge_detect,
+            .denoise_strength = g_denoise_strength,
+            .render_width = g_render_width,
+            .render_height = g_render_height,
+        }, g_show_hud, g_show_console, spheres.items, current_fps); // TAB=HUD, ~=Console
+        profiler.end(.hud_render);
 
+        profiler.start(.swap_buffers);
         _ = win32.SwapBuffers(hdc);
+        profiler.end(.swap_buffers);
+
+        // End frame timing and update stats
+        profiler.end(.frame_total);
+        profiler.frame();
 
         // Update previous camera state for next frame's motion blur
         prev_camera_pos = g_camera_pos;
@@ -1875,6 +2091,25 @@ pub fn main() !void {
             g_save_screenshot = false;
         }
     }
+
+    // Save settings on exit
+    settings.captureFromGlobals(
+        g_fov,
+        g_aperture,
+        g_focus_dist,
+        g_samples_per_frame,
+        g_bloom_strength,
+        g_exposure,
+        g_chromatic_strength,
+        g_vignette_strength,
+        g_motion_blur_strength,
+        g_denoise_strength,
+        g_show_hud,
+        g_show_console,
+    );
+    settings.save(allocator) catch |err| {
+        std.debug.print("Failed to save settings: {}\n", .{err});
+    };
 
     if (g_hglrc) |ctx| {
         _ = wglMakeCurrent(null, null);
