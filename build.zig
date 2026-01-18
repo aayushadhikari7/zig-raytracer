@@ -14,10 +14,11 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
-    // Link Windows and OpenGL libraries
-    exe.linkSystemLibrary("gdi32");
-    exe.linkSystemLibrary("user32");
-    exe.linkSystemLibrary("opengl32");
+    // Link Windows and OpenGL libraries (use root_module for newer Zig)
+    exe.root_module.linkSystemLibrary("gdi32", .{});
+    exe.root_module.linkSystemLibrary("user32", .{});
+    exe.root_module.linkSystemLibrary("opengl32", .{});
+    exe.root_module.linkSystemLibrary("comdlg32", .{}); // For file dialogs
 
     b.installArtifact(exe);
 

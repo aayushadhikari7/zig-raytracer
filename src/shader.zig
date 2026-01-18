@@ -67,7 +67,7 @@ pub const compute_shader_source: [*:0]const u8 =
     \\uniform float u_holographic;  // Holographic material
     \\uniform float u_ascii_mode;   // ASCII art mode
     \\
-    \\#define MAX_DEPTH 4
+    \\#define MAX_DEPTH 4  // Original depth
     \\#define BVH_STACK_SIZE 48  // Reduced for better performance
     \\
     \\struct Sphere {
@@ -515,7 +515,7 @@ pub const compute_shader_source: [*:0]const u8 =
     \\
     \\    // Start ray march from bounding sphere entry (or t_min if inside)
     \\    float t = max(t_min, t_enter - 0.01);
-    \\    const int MAX_STEPS = 48;  // Reduced from 64
+    \\    const int MAX_STEPS = 24;  // Optimized: 48->24 for FPS
     \\    const float EPSILON = 0.001;
     \\
     \\    for (int i = 0; i < MAX_STEPS && t < t_max; i++) {
@@ -536,7 +536,7 @@ pub const compute_shader_source: [*:0]const u8 =
     \\            rec.texture_id = 0;
     \\            return true;
     \\        }
-    \\        t += max(d, EPSILON * 2.0);  // Slightly larger minimum step
+    \\        t += max(d, EPSILON * 2.0);  // Minimum step size
     \\    }
     \\    return false;
     \\}
@@ -954,7 +954,9 @@ pub const compute_shader_source: [*:0]const u8 =
     \\
     \\// Fresnel-Schlick approximation
     \\vec3 FresnelSchlick(float cosTheta, vec3 F0) {
-    \\    return F0 + (1.0 - F0) * pow(clamp(1.0 - cosTheta, 0.0, 1.0), 5.0);
+    \\    float x = clamp(1.0 - cosTheta, 0.0, 1.0);
+    \\    float x2 = x * x;
+    \\    return F0 + (1.0 - F0) * (x2 * x2 * x);  // x^5 without pow()
     \\}
     \\
     \\// Thin-film iridescence - simulates soap bubbles, oil slicks, beetle shells
@@ -2185,9 +2187,11 @@ pub const compute_shader_source: [*:0]const u8 =
     \\    vec3 result = accum.rgb / accum.a;
     \\
     \\    // Temporal/spatial denoising - adaptive based on sample count
-    \\    if (u_denoise > 0.0 && accum.a < 32.0) {  // Skip after enough samples
+    \\    if (u_denoise > 0.0 && accum.a < 12.0) {  // Optimized: 32->12 for FPS
     \\        result = spatialDenoise(pixel, result, accum.a);
-    \\        result = varianceGuidedDenoise(pixel, result, accum.a);
+    \\        if (accum.a < 6.0) {  // Skip variance denoise early
+    \\            result = varianceGuidedDenoise(pixel, result, accum.a);
+    \\        }
     \\    }
     \\
     \\    // Chromatic aberration - only run if enabled (expensive!)
@@ -2258,10 +2262,10 @@ pub const compute_shader_source: [*:0]const u8 =
     \\        vec3 flare = vec3(0.0);
     \\
     \\        // Sample multiple points looking for bright areas
-    \\        const int FLARE_SAMPLES = 8;
+    \\        const int FLARE_SAMPLES = 4;  // Optimized: 8->4 for FPS
     \\        for (int i = 0; i < FLARE_SAMPLES; i++) {
     \\            float angle = float(i) * 3.14159265 * 2.0 / float(FLARE_SAMPLES);
-    \\            for (float dist = 0.1; dist < 0.5; dist += 0.1) {
+    \\            for (float dist = 0.2; dist < 0.5; dist += 0.2) {  // Optimized: fewer samples
     \\                vec2 sampleUV = center + vec2(cos(angle), sin(angle)) * dist;
     \\                ivec2 samplePixel = ivec2(sampleUV * vec2(u_width, u_height));
     \\                samplePixel = clamp(samplePixel, ivec2(0), ivec2(u_width - 1, u_height - 1));
@@ -2306,8 +2310,7 @@ pub const compute_shader_source: [*:0]const u8 =
     \\    // ACES filmic tone mapping (cinematic look)
     \\    result = (result * (2.51 * result + 0.03)) / (result * (2.43 * result + 0.59) + 0.14);
     \\
-    \\    // Subtle contrast enhancement
-    \\    result = pow(result, vec3(1.05));
+    \\    // Removed pow(result, vec3(1.05)) for FPS - minimal visual difference
     \\
     \\    // Gamma correction
     \\    result = pow(clamp(result, 0.0, 1.0), vec3(1.0 / 2.2));

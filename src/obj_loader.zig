@@ -9,6 +9,11 @@ const GPUTriangle = types.GPUTriangle;
 // OBJ FILE LOADER
 // ============================================================================
 
+// Get IO instance for file operations
+fn getIo() std.Io {
+    return std.Io.Threaded.global_single_threaded.io();
+}
+
 pub const ObjMesh = struct {
     triangles: std.ArrayList(GPUTriangle),
 
@@ -27,19 +32,24 @@ pub const ObjTransform = struct {
 };
 
 pub fn loadObj(allocator: std.mem.Allocator, path: []const u8, transform: ObjTransform) !ObjMesh {
+    const io = getIo();
+
     var mesh = ObjMesh{
         .triangles = std.ArrayList(GPUTriangle){},
     };
     errdefer mesh.deinit(allocator);
 
     // Read file
-    const file = std.fs.cwd().openFile(path, .{}) catch |err| {
+    const cwd = std.Io.Dir.cwd();
+    const file = cwd.openFile(io, path, .{}) catch |err| {
         std.debug.print("Failed to open OBJ file '{s}': {}\n", .{ path, err });
         return err;
     };
-    defer file.close();
+    defer file.close(io);
 
-    const content = file.readToEndAlloc(allocator, 50 * 1024 * 1024) catch |err| {
+    var read_buf: [8192]u8 = undefined;
+    var reader = file.reader(io, &read_buf);
+    const content = reader.interface.allocRemaining(allocator, std.Io.Limit.limited(50 * 1024 * 1024)) catch |err| {
         std.debug.print("Failed to read OBJ file: {}\n", .{err});
         return err;
     };
